@@ -15,12 +15,8 @@ import json
 import os
 import pathlib
 import re
-import select
 import shlex
-import signal
-import sys
 import textwrap
-import threading
 import time
 import traceback
 import typing
@@ -400,8 +396,19 @@ def ha_recovery_for_consolidation_mode() -> None:
             'job_id', 'controller_pid', 'controller_pid_started_at',
             'schedule_state', 'status'
         ])
+        # get_managed_jobs_with_filters returns one row per task, but
+        # multi-task jobs share the same job_id (and the same job_info
+        # columns we read here) -- process each job only once. Otherwise a
+        # multi-task job would be reset once per task, and each reset after
+        # the first can re-orphan the job right after a controller has
+        # claimed it, spawning duplicate controllers for the same job.
+        seen_job_ids: Set[int] = set()
         for job in jobs:
             job_id = job['job_id']
+            if job_id in seen_job_ids:
+                continue
+            seen_job_ids.add(job_id)
+
             controller_pid = job['controller_pid']
             controller_pid_started_at = job.get('controller_pid_started_at')
 
@@ -443,7 +450,24 @@ def ha_recovery_for_consolidation_mode() -> None:
                     # INACTIVE job may be mid-submission, don't set to WAITING.
                     managed_job_state.ManagedJobScheduleState.INACTIVE,
             ]:
-                managed_job_state.reset_job_for_recovery(job_id)
+                # Compare-and-swap against the values we observed above: if a
+                # controller claimed the job since then, the reset must not
+                # apply, or we would orphan the job again immediately after
+                # the claim and end up with a duplicate controller for it.
+                if not managed_job_state.reset_job_for_recovery(
+                        job_id,
+                        expected_pid=controller_pid,
+                        expected_pid_started_at=controller_pid_started_at,
+                        expected_schedule_state=job['schedule_state']):
+                    # Lost the race to a concurrent claim (or to some other
+                    # actor that changed the job's state). Whoever won owns
+                    # the job now, so don't retry - just move on.
+                    message = (f'Skipping recovery of job {job_id}: its '
+                               'controller ownership or schedule state '
+                               'changed since it was observed.\n')
+                    logger.info(message)
+                    f.write(message)
+                    continue
                 message = (f'Job {job_id} completed recovery at '
                            f'{datetime.now()}\n')
                 logger.info(message)
@@ -2200,83 +2224,13 @@ def stream_logs_by_id(
         See exceptions.JobExitCode for possible exit codes.
     """
 
-    # Start a background watchdog thread that detects when the kubectl
-    # exec connection has been dropped (client disconnect). On Kubernetes,
-    # kubectl exec -i does not allocate a PTY, so no SIGHUP is sent when
-    # the connection drops. The only signal is that stdin reaches EOF
-    # (the kubelet closes the stdin pipe). This thread monitors stdin and
-    # terminates the process when disconnection is detected, preventing
-    # leaked stream_logs processes on the controller. Changing the exec call to
-    # also include -t does not result in the kubelet sending a SIGHUP to the
-    # remote end of the connection.
-    #
-    # The API server now passes stdin=subprocess.PIPE (instead of
-    # DEVNULL) to kubectl exec -i, so stdin on the controller is a live
-    # pipe that only reaches EOF when the connection actually drops.
-    #
-    # For SSH controllers, stdin is a PTY (from ssh -tt), so SIGHUP
-    # handles cleanup natively. For consolidation mode or other local
-    # invocations, stdin may be /dev/null or already closed (EOF). We
-    # check at startup: if stdin is already at EOF, we skip stdin
-    # monitoring entirely to avoid false positives. Only a live stdin
-    # (not yet at EOF) is worth monitoring this is the case for
-    # kubectl exec -i with stdin=subprocess.PIPE.
-    check_stdin_eof = False
-    try:
-        readable, _, _ = select.select([sys.stdin], [], [], 0)
-        if readable:
-            # stdin is immediately readable check if it's already EOF
-            data = os.read(sys.stdin.fileno(), 1)
-            if data:
-                # Got actual data (unexpected but harmless); stdin is live
-                check_stdin_eof = True
-            # else: EOF at startup, don't monitor
-        else:
-            # stdin is not immediately readable it's a live pipe/TTY
-            # waiting for input, meaning we have a real connection
-            check_stdin_eof = True
-    except (ValueError, OSError):
-        # stdin is already closed or invalid — not useful for monitoring
-        pass
-
-    def _orphan_watchdog() -> None:
-        """Background thread that monitors for connection drop."""
-        initial_parent_pid = os.getppid()
-        while True:
-            time.sleep(5)
-            # Check 1: Parent PID changed (reparented to init/subreaper)
-            if os.getppid() != initial_parent_pid:
-                logger.info('Parent process died, terminating.')
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
-            # Check 2: stdin EOF (kubectl exec -i connection dropped).
-            # Only checked when stdin is a pipe (Kubernetes), not a TTY
-            # (SSH). With SSH -tt, the PTY delivers SIGHUP on disconnect,
-            # so this check is unnecessary and could cause false positives.
-            if not check_stdin_eof:
-                continue
-            try:
-                readable, _, _ = select.select([sys.stdin], [], [], 0)
-                if readable:
-                    data = os.read(sys.stdin.fileno(), 1)
-                    if not data:
-                        logger.info('stdin EOF detected (connection dropped), '
-                                    'terminating.')
-                        os.kill(os.getpid(), signal.SIGTERM)
-                        return
-            except (ValueError, OSError):
-                logger.info('stdin closed, terminating.')
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
-
     # The watchdog detects a dropped `kubectl exec` connection, which only
     # happens when this runs as a subprocess on the controller. Inside a
     # context we are in the API server, where a client disconnect arrives as
     # ctx.cancel() instead, and this thread's own loop has no exit condition:
     # it would outlive the request and accumulate one thread per tail call.
     if context_lib.get() is None:
-        watchdog = threading.Thread(target=_orphan_watchdog, daemon=True)
-        watchdog.start()
+        log_lib.start_orphan_watchdog()
 
     def should_keep_logging(status: managed_job_state.ManagedJobStatus) -> bool:
         # If we see CANCELLING, just exit - we could miss some job logs but the
@@ -2323,6 +2277,15 @@ def stream_logs_by_id(
             return (f'No task found matching {task!r} in job {job_id}. '
                     f'Valid task IDs are {valid_range}.',
                     exceptions.JobExitCode.NOT_FOUND)
+
+    runtime_log_result = managed_job_runtime.tail_managed_job_logs(
+        job_id=job_id,
+        task_id=filtered_task_id,
+        follow=follow,
+        tail=tail,
+        tail_offset=tail_offset)
+    if runtime_log_result is not None:
+        return '', runtime_log_result
 
     # Follow the jobs controller log during provisioning so the user sees the
     # same spinner messages that `sky launch` shows. The controller relays the
