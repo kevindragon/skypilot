@@ -16,7 +16,7 @@ from prometheus_client import generate_latest
 from prometheus_client import multiprocess
 import prometheus_client as prom
 import psutil
-import starlette.middleware.base
+import starlette.convertors
 import starlette.types
 import uvicorn
 
@@ -27,7 +27,10 @@ from sky import skypilot_config
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.jobs import stall
 from sky.metrics import utils as metrics_utils
+from sky.provision.kubernetes import utils as kubernetes_utils
+from sky.server import caller_usage
 from sky.server import constants as server_constants
+from sky.server import container_memory
 from sky.server import local_disk
 from sky.server import loop_stall
 from sky.server import middleware_utils
@@ -58,6 +61,12 @@ def register_multiproc_cleanup_atexit() -> None:
     written gauge value visible to every future scrape — for ``liveall``
     gauges this can pin a stale per-pid value indefinitely.
 
+    It also records this process's identity for the reaper (see
+    ``_writer_exited``), and removes the live-gauge files of an earlier
+    writer that held the same pid, except those this process already has
+    open (see ``_open_live_gauge_files``). Call it before the process writes
+    any live gauge.
+
     Safe to call more than once per process; only the first call registers.
     Only registers when ``PROMETHEUS_MULTIPROC_DIR`` is set; a no-op in
     single-process / unit-test environments.
@@ -65,16 +74,117 @@ def register_multiproc_cleanup_atexit() -> None:
     global _multiproc_cleanup_registered
     if _multiproc_cleanup_registered:
         return
-    if not os.environ.get('PROMETHEUS_MULTIPROC_DIR'):
+    multiproc_dir = os.environ.get('PROMETHEUS_MULTIPROC_DIR')
+    if not multiproc_dir:
         return
     pid = os.getpid()
-    atexit.register(multiprocess.mark_process_dead, pid)
+    identity = _process_identity(pid)
+    if identity is not None:
+        try:
+            if _read_writer_identity(multiproc_dir,
+                                     pid) not in (None, identity):
+                open_files = _open_live_gauge_files(pid, multiproc_dir)
+                if open_files is not None:
+                    _remove_live_gauge_files(multiproc_dir, pid, open_files)
+            with open(_writer_identity_path(multiproc_dir, pid),
+                      'w',
+                      encoding='utf-8') as f:
+                f.write(identity)
+        except OSError:
+            logger.warning(
+                'Failed to record this process as a prometheus '
+                'multiproc writer.',
+                exc_info=True)
+    atexit.register(_forget_writer, multiproc_dir, pid)
     _multiproc_cleanup_registered = True
 
 
+_HAS_PROCFS = os.path.isdir('/proc/self')
+
+
+def _process_identity(pid: int) -> Optional[str]:
+    """A value that differs between processes that held the same pid.
+
+    None when no process holds the pid or the holder is a zombie. Raises
+    psutil.Error when the holder cannot be inspected. On Linux it is the
+    start time in clock ticks since boot (/proc/<pid>/stat field 22), which
+    unlike psutil's create_time() does not depend on when the reading
+    process sampled the boot time.
+    """
+    if _HAS_PROCFS:
+        try:
+            with open(f'/proc/{pid}/stat', 'rb') as f:
+                stat = f.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except PermissionError as e:
+            raise psutil.AccessDenied(pid) from e
+        fields = stat[stat.rindex(b')') + 2:].split()
+        return None if fields[0] == b'Z' else fields[19].decode()
+    try:
+        proc = psutil.Process(pid)
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return None
+        return repr(proc.create_time())
+    except psutil.NoSuchProcess:
+        return None
+
+
+def _writer_identity_path(multiproc_dir: str, pid: int) -> str:
+    return os.path.join(multiproc_dir, f'liveowner_{pid}')
+
+
+def _read_writer_identity(multiproc_dir: str, pid: int) -> Optional[str]:
+    try:
+        with open(_writer_identity_path(multiproc_dir, pid),
+                  'r',
+                  encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def _live_gauge_file_paths(multiproc_dir: str, pid: int) -> Set[str]:
+    return {
+        os.path.realpath(path) for path in glob.glob(
+            os.path.join(multiproc_dir, f'gauge_live*_{pid}.db'))
+    }
+
+
+def _open_live_gauge_files(pid: int, multiproc_dir: str) -> Optional[Set[str]]:
+    """The pid's live-gauge files that the process holding the pid has open.
+
+    None when the holder cannot be inspected. A worker that got a dead
+    writer's pid opens that pid's existing files when it creates its
+    unlabeled gauges at import, before it registers. Unlinking an open file
+    hides everything the process writes to it for the rest of its life.
+    """
+    files = _live_gauge_file_paths(multiproc_dir, pid)
+    try:
+        return {f.path for f in psutil.Process(pid).open_files()} & files
+    except psutil.NoSuchProcess:
+        return set()
+    except psutil.Error:
+        return None
+
+
+def _remove_live_gauge_files(multiproc_dir: str, pid: int,
+                             keep: Set[str]) -> None:
+    for path in _live_gauge_file_paths(multiproc_dir, pid) - keep:
+        os.remove(path)
+
+
+def _forget_writer(multiproc_dir: str, pid: int) -> None:
+    multiprocess.mark_process_dead(pid, multiproc_dir)
+    try:
+        os.remove(_writer_identity_path(multiproc_dir, pid))
+    except OSError:
+        pass
+
+
 # Default reap interval. Tuned to give prompt cleanup of stale per-pid
-# files without measurable overhead: one directory glob + one pid_exists()
-# check per unique pid per tick.
+# files without measurable overhead: one directory glob + a few /proc reads
+# per unique pid per tick.
 _REAPER_INTERVAL_SECONDS = 60
 # Matches the per-pid live-gauge file names written by
 # ``prometheus_client.multiprocess``: ``gauge_live{all,sum,max,min}_<pid>.db``.
@@ -101,8 +211,41 @@ def _scan_multiproc_pids(multiproc_dir: str) -> Set[int]:
     return pids
 
 
+# pid -> identity of the process that held the pid when the reaper first
+# saw the pid's live-gauge files, for writers that did not record their own
+# identity. Only the reaper daemon touches it.
+_live_gauge_writers: Dict[int, str] = {}
+
+_WRITER_IDENTITY_FILE_PID_RE = re.compile(r'^liveowner_([0-9]+)$')
+
+
+def _writer_exited(pid: int, multiproc_dir: str) -> bool:
+    """Whether the process that writes ``pid``'s live-gauge files is gone.
+
+    An existing pid is not enough: the writer may be a zombie its parent
+    has not waited for, or the kernel may have given the pid to another
+    process. The writer's identity is the one it recorded when it
+    registered; for a process that did not register, it is the holder of
+    the pid when the reaper first saw its files. A holder that has one of
+    the files open writes to them, whatever its identity.
+    """
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        identity = _process_identity(pid)
+    except psutil.Error:
+        return False
+    if identity is None:
+        return True
+    recorded = _read_writer_identity(multiproc_dir, pid)
+    if recorded is None:
+        recorded = _live_gauge_writers.setdefault(pid, identity)
+    return (recorded != identity and
+            _open_live_gauge_files(pid, multiproc_dir) == set())
+
+
 def _reap_stale_multiproc_files() -> int:
-    """Remove prometheus multiproc files for pids that no longer exist.
+    """Remove prometheus multiproc files of writers that have exited.
 
     Returns the number of pids reaped.
     """
@@ -110,14 +253,23 @@ def _reap_stale_multiproc_files() -> int:
     if not multiproc_dir:
         return 0
     file_pids = _scan_multiproc_pids(multiproc_dir)
+    for pid in set(_live_gauge_writers) - file_pids:
+        del _live_gauge_writers[pid]
+    # Identity files of writers that exited before writing a live gauge.
+    for path in glob.glob(os.path.join(multiproc_dir, 'liveowner_*')):
+        m = _WRITER_IDENTITY_FILE_PID_RE.match(os.path.basename(path))
+        if (m is not None and int(m.group(1)) not in file_pids and
+                _writer_exited(int(m.group(1)), multiproc_dir)):
+            _forget_writer(multiproc_dir, int(m.group(1)))
     if not file_pids:
         return 0
     reaped = 0
     for pid in file_pids:
-        if psutil.pid_exists(pid):
+        if not _writer_exited(pid, multiproc_dir):
             continue
+        _live_gauge_writers.pop(pid, None)
         try:
-            multiprocess.mark_process_dead(pid)
+            _forget_writer(multiproc_dir, pid)
             reaped += 1
         except Exception:  # pylint: disable=broad-except
             # Don't let a single bad file or a race with another reaper
@@ -141,23 +293,18 @@ async def multiproc_reaper_daemon(
     live-gauge value can be served by ``/metrics`` indefinitely (until
     the API server pod itself restarts and wipes the metrics dir). This
     daemon scans the multiproc dir from the main API server process and
-    invokes ``mark_process_dead`` on behalf of any writer whose pid no
-    longer exists.
+    invokes ``mark_process_dead`` on behalf of any writer that has
+    exited.
 
-    Reaps any pid whose live-gauge file is present but for which
-    ``psutil.pid_exists`` returns False (i.e. the pid no longer maps to
-    any running process). The descendant relationship is intentionally
-    not used as the membership signal: writers may not always be direct
-    descendants of the main API server process (e.g. workers reparented
-    to init after an intermediate exits), and a strict descendant filter
-    would leak files from those legitimate writers.
-
-    Known false-negative: if a dead worker's pid is later reused by an
-    unrelated process inside the same pod, its files keep being scraped
-    until either that unrelated process exits, the worker's pid wraps to
-    another value, or a same-pid SkyPilot writer overwrites the file.
-    PID reuse within a pod's lifetime is rare in practice (Linux pid_max
-    is large and pids are allocated sequentially), so this is accepted.
+    Reaps a pid whose live-gauge files are present when no process holds
+    the pid, when the process holding it is a zombie, or when it is not
+    the writer, i.e. the pid was reused (see ``_writer_exited``). The
+    descendant
+    relationship is intentionally not used as the membership signal:
+    writers may not always be direct descendants of the main API server
+    process (e.g. workers reparented to init after an intermediate
+    exits), and a strict descendant filter would leak files from those
+    legitimate writers.
 
     No-op when ``PROMETHEUS_MULTIPROC_DIR`` is unset.
     """
@@ -698,6 +845,149 @@ try:
 except ValueError:
     pass
 
+_CONTAINER_MEMORY_USAGE_HELP = (
+    'Memory charged to the API server container\'s cgroup (memory.current), '
+    'including page cache the kernel can reclaim. See '
+    'sky_apiserver_container_memory_unreclaimable_bytes for the part it '
+    'cannot.')
+
+_CONTAINER_MEMORY_UNRECLAIMABLE_HELP = (
+    'Memory the kernel cannot reclaim from the API server container without '
+    'swap: memory.current minus page cache (memory.stat file) and '
+    'reclaimable slab (slab_reclaimable), plus shmem. '
+    'Compare it with the container\'s memory limit, or with its node\'s '
+    'allocatable memory when there is no limit, to see how close the '
+    'container is to an OOM kill.')
+
+_CONTAINER_MEMORY_STAT_HELP = (
+    'One field of the API server container\'s cgroup memory.stat: anon is '
+    'process memory not backed by files, file is page cache (including '
+    'shmem), kernel is kernel memory charged to the container, shmem is '
+    'tmpfs and shared memory, slab_reclaimable is the part of kernel memory '
+    'the kernel frees under pressure (dentry and inode caches).')
+
+_CONTAINER_MEMORY_LIMIT_HELP = (
+    'The API server container\'s cgroup memory limit (memory.max). No series '
+    'is emitted when the container has no limit, in which case its node\'s '
+    'allocatable memory is the bound.')
+
+_CONTAINER_PROCESSES_HELP = (
+    'Processes in the API server container, by type: main (the server '
+    'process), server (uvicorn workers), worker:<group> (executor workers), '
+    'controller (managed-job controllers), kubectl_exec, '
+    'kubectl_port_forward, kubectl_other, subprocess_daemon, aws (AWS CLI), '
+    'shell (sh/bash), ssh_mux (ssh ControlMaster), ssh_other, '
+    'resource_tracker (multiprocessing), zombie (exited, not yet waited '
+    'for), python_other and other. Every type is always reported.')
+
+_CONTAINER_THREADS_HELP = (
+    'Threads in the API server container\'s processes, by process type.')
+
+_CONTAINER_RSS_ANON_HELP = (
+    'Sum of RssAnon over the API server container\'s processes, by process '
+    'type. Unlike per-process RSS it leaves out file pages, so summed over '
+    'types it is comparable to memory.stat anon.')
+
+_CONTAINER_RSS_HELP = (
+    'Sum of VmRSS (anon, file and shmem pages) over the API server '
+    'container\'s processes, by process type. A page mapped by several '
+    'processes is counted once per process.')
+
+_CONTAINER_MAX_RSS_ANON_HELP = (
+    'RssAnon of the largest process of each type in the API server '
+    'container.')
+
+_CONTAINER_SCAN_DURATION_HELP = (
+    'Wall-clock seconds the last read of the container\'s cgroup and '
+    'processes took, including the start of the child process that does '
+    'it. Runs off the scrape path.')
+
+
+class ContainerMemoryCollector:
+    """Collector for the API server container's memory and processes.
+
+    See sky/server/container_memory.py. Emits nothing outside a cgroup v2
+    container. The census runs in a child interpreter so that this process's
+    busy threads cannot slow it down, and ResilientCollector keeps it off the
+    scrape path.
+    """
+
+    def describe(self):
+        yield prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_memory_usage_bytes',
+            _CONTAINER_MEMORY_USAGE_HELP)
+
+    def collect(self):
+        snapshot = container_memory.scan_in_subprocess()
+        if snapshot is None:
+            return
+        yield prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_memory_usage_bytes',
+            _CONTAINER_MEMORY_USAGE_HELP,
+            value=snapshot.usage_bytes)
+        unreclaimable = prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_memory_unreclaimable_bytes',
+            _CONTAINER_MEMORY_UNRECLAIMABLE_HELP)
+        if snapshot.unreclaimable_bytes is not None:
+            unreclaimable.add_metric([], snapshot.unreclaimable_bytes)
+        yield unreclaimable
+        stat = prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_memory_stat_bytes',
+            _CONTAINER_MEMORY_STAT_HELP,
+            labels=['stat'])
+        for key, value in snapshot.stat_bytes.items():
+            stat.add_metric([key], value)
+        yield stat
+        limit = prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_memory_limit_bytes',
+            _CONTAINER_MEMORY_LIMIT_HELP)
+        if snapshot.limit_bytes is not None:
+            limit.add_metric([], snapshot.limit_bytes)
+        yield limit
+
+        processes = prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_processes',
+            _CONTAINER_PROCESSES_HELP,
+            labels=['type'])
+        threads = prom_core.GaugeMetricFamily('sky_apiserver_container_threads',
+                                              _CONTAINER_THREADS_HELP,
+                                              labels=['type'])
+        rss_anon = prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_rss_anon_bytes',
+            _CONTAINER_RSS_ANON_HELP,
+            labels=['type'])
+        max_rss_anon = prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_max_rss_anon_bytes',
+            _CONTAINER_MAX_RSS_ANON_HELP,
+            labels=['type'])
+        rss = prom_core.GaugeMetricFamily('sky_apiserver_container_rss_bytes',
+                                          _CONTAINER_RSS_HELP,
+                                          labels=['type'])
+        for process_type, usage in sorted(snapshot.types.items()):
+            processes.add_metric([process_type], usage.processes)
+            threads.add_metric([process_type], usage.threads)
+            rss_anon.add_metric([process_type], usage.rss_anon_bytes)
+            max_rss_anon.add_metric([process_type], usage.max_rss_anon_bytes)
+            rss.add_metric([process_type], usage.rss_bytes)
+        yield processes
+        yield threads
+        yield rss_anon
+        yield max_rss_anon
+        yield rss
+
+        yield prom_core.GaugeMetricFamily(
+            'sky_apiserver_container_scan_duration_seconds',
+            _CONTAINER_SCAN_DURATION_HELP,
+            value=snapshot.duration_seconds)
+
+
+_CONTAINER_MEMORY_COLLECTOR = _wrap_collector(ContainerMemoryCollector())
+
+try:
+    prom.REGISTRY.register(_CONTAINER_MEMORY_COLLECTOR)  # non-multiprocess
+except ValueError:
+    pass
+
 _COLLECTOR_HEALTH_COLLECTOR = CollectorHealthCollector()
 
 try:
@@ -791,8 +1081,10 @@ def _label_or_default(value: Optional[str], default: str) -> str:
 _EMERGENCY_EPISODES_MAX_SERIES = 100
 
 _RECOVERY_EVENTS_HELP = (
-    'Count of managed-job RECOVERING events currently retained in '
-    'job_events, by recovery source and workspace. NOT monotone: '
+    'Count of managed-job recovery events currently retained in '
+    'job_events, by recovery source and workspace: every RECOVERING event, '
+    'plus the RUNNING events of emergency recoveries that kept the job on '
+    'its cluster instead of relaunching it. NOT monotone: '
     'job_events has a retention window, so aged-out rows decrease the '
     'value — use clamp_min(delta(...), 0) for rates, never increase(). '
     'Events written before recovery_source existed (NULL) are excluded.')
@@ -824,8 +1116,10 @@ class ManagedJobsCollector:
     Also emits two recovery-observability gauges:
 
     * ``sky_managed_job_recovery_events_count{recovery_source,
-      workspace}`` — RECOVERING ``job_events`` rows currently retained,
-      by source (FAILURE / EMERGENCY / RESTART). Not monotone (event
+      workspace}`` — recovery ``job_events`` rows currently retained
+      (RECOVERING, plus RUNNING / WINDING_DOWN rows tagged EMERGENCY by an
+      emergency recovery that kept the job on its cluster), by source
+      (FAILURE / EMERGENCY / RESTART). Not monotone (event
       retention prunes old rows), so rate queries must use
       ``clamp_min(delta(...), 0)``, never ``increase(...)``.
     * ``sky_managed_job_emergency_recovery_attempts{job_id, job_name,
@@ -1235,6 +1529,12 @@ class WorkspaceUsageCollector:
             if launched_resources is None:
                 continue
             num_nodes = max(1, int(getattr(handle, 'launched_nodes', 1) or 1))
+            # launched_resources describes one task node; a multi-host TPU
+            # slice on Kubernetes has several cluster nodes (pods) per task
+            # node.
+            num_nodes = max(
+                1, kubernetes_utils.num_task_nodes(num_nodes,
+                                                   launched_resources))
 
             accelerators = (launched_resources.accelerators or {})
             for acc_name, acc_count in accelerators.items():
@@ -1409,6 +1709,7 @@ def metrics() -> fastapi.Response:
         registry.register(_SQLITE_DB_SIZE_COLLECTOR)
         registry.register(_WORKSPACE_USAGE_COLLECTOR)
         registry.register(_LOCAL_DISK_USAGE_COLLECTOR)
+        registry.register(_CONTAINER_MEMORY_COLLECTOR)
         registry.register(_COLLECTOR_HEALTH_COLLECTOR)
         registry.register(_SERVER_START_TIME_COLLECTOR)
         if _MANAGED_JOBS_COLLECTOR is not None:
@@ -1498,11 +1799,16 @@ class _FederationTargets:
         central Prometheus scrapes the local cluster's exporters directly, so
         federating them again would only duplicate the raw series under a
         stamped copy. The dashboard matches the local cluster with cluster=""
-        (see /dashboard_config local_contexts).
+        (see /dashboard_config local_contexts). Contexts known to be
+        unreachable are dropped too, before the local-cluster check probes
+        them.
         """
         skypilot_config.reload_config()
         annotations.clear_request_level_cache()
-        contexts = core.get_all_contexts()
+        contexts = [
+            ctx for ctx in core.get_all_contexts()
+            if kubernetes_utils.known_unreachable_reason(ctx) is None
+        ]
         _, remote_contexts = metrics_utils.split_local_remote_contexts(contexts)
         # Slurm clusters federate through their login node; only clusters
         # with a configured prometheus_url participate. Enumeration reads
@@ -2043,7 +2349,7 @@ def _unrouted_path_label(path: str, literal_routes: FrozenSet[str]) -> str:
     return OTHER_PATH_LABEL
 
 
-class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
+class PrometheusMiddleware:
     """Middleware to collect Prometheus metrics for HTTP requests.
 
     Registered as the OUTERMOST middleware (added last in
@@ -2062,16 +2368,17 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     stamped a reason (`middleware_utils.mark_rejection`), the response is
     also counted in `sky_apiserver_request_rejections_total`.
 
-    Duration is measured from entry into this layer, i.e. it includes the
-    time the authentication middlewares spend (DB lookups under their
-    deadline): it is the latency the client observed.
+    Duration is measured from entry into this layer to the start of the
+    response, i.e. it includes the time the authentication middlewares spend
+    (DB lookups under their deadline) but not the time spent streaming the
+    body: it is the latency until the client sees the response headers.
 
-    WebSocket scopes pass straight through, as for every BaseHTTPMiddleware;
-    refused handshakes are counted by `middleware_utils.websocket_aware`.
+    WebSocket scopes pass straight through; refused handshakes are counted by
+    `middleware_utils.websocket_aware`.
     """
 
     def __init__(self, app: starlette.types.ASGIApp):
-        super().__init__(app)
+        self.app = app
         # (route count, literal route paths) of the app, rebuilt if routes
         # were added since. Routes are all registered before the first
         # request in practice; the count check keeps the memo honest anyway.
@@ -2084,27 +2391,50 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             self._literal_routes = (count, _literal_route_paths(app))
         return self._literal_routes[1]
 
-    async def dispatch(self, request: fastapi.Request, call_next):
+    async def __call__(self, scope: starlette.types.Scope,
+                       receive: starlette.types.Receive,
+                       send: starlette.types.Send) -> None:
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+        request = fastapi.Request(scope, receive)
         logger.debug(f'PROM Middleware Request: {request}, {request.url.path}')
         start_time = time.time()
         method = request.method
-        status_code = 0
+        recorded = False
+        http_call, http_call_token = caller_usage.begin_http_call()
 
+        def record(status_code: int, body_bytes: Optional[int]) -> None:
+            nonlocal recorded
+            recorded = True
+            # This layer is outermost, so it sees 100% of responses: a
+            # recording fault must not turn a served request into a 500.
+            middleware_utils.record_safely('request', self._record, request,
+                                           method, status_code, start_time)
+            middleware_utils.record_safely('caller usage', _record_caller_usage,
+                                           request, http_call, start_time,
+                                           body_bytes)
+
+        async def send_and_record(message: starlette.types.Message) -> None:
+            if message['type'] == 'http.response.start' and not recorded:
+                record(message['status'],
+                       _content_length(message.get('headers', ())))
+            await send(message)
+
+        status_code = 0
         try:
-            response = await call_next(request)
-            status_code = response.status_code
+            await self.app(scope, receive, send_and_record)
+            # Returned without starting a response; the server answers 500.
+            status_code = 500
         except Exception:  # pylint: disable=broad-except
             # Escaped every inner layer; Starlette's error handler (outside
             # us) turns it into a bare 500. Count what the client sees.
             status_code = 500
             raise
         finally:
-            # This layer is outermost, so it sees 100% of responses: a
-            # recording fault must not turn a served request into a 500.
-            middleware_utils.record_safely('request', self._record, request,
-                                           method, status_code, start_time)
-
-        return response
+            if not recorded:
+                record(status_code, None)
+            caller_usage.end_http_call(http_call_token)
 
     def _path_label(self, request: fastapi.Request, raw_path: str) -> str:
         """`path` label, never raising: a fault must not lose the count.
@@ -2155,6 +2485,62 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         if request_name is not None:
             metrics_utils.SKY_APISERVER_REQUEST_GET_DURATION_SECONDS.labels(
                 name=request_name, status=status_code_group).observe(duration)
+
+
+# Route handlers left out of caller usage: /api/get is counted by the request
+# it returns; health probes and dashboard pages are not API usage.
+_CALLER_USAGE_SKIPPED_PATHS = frozenset(
+    {'/api/get', '/api/health', '/dashboard'})
+_CALLER_USAGE_SKIPPED_PREFIXES = ('/dashboard/',)
+
+
+def _content_length(headers) -> Optional[int]:
+    for key, value in headers:
+        if key.lower() == b'content-length':
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _record_caller_usage(request: fastapi.Request,
+                         http_call: caller_usage.HttpCall, start_time: float,
+                         body_bytes: Optional[int]) -> None:
+    caller = caller_usage.caller_of_user(
+        getattr(request.state, 'impersonator', None) or
+        getattr(request.state, 'auth_user', None))
+    headers = request.headers
+    caller_usage.record_client(caller, headers.get('X-SkyPilot-Client-Type'),
+                               headers.get('User-Agent'),
+                               headers.get(server_constants.API_VERSION_HEADER))
+    # Set by /api/get and by a synchronous call that returned a request's
+    # result: the body is that request's result.
+    request_name = getattr(request.state, 'request_name', None)
+    if request_name is not None:
+        caller_usage.record_returned_bytes(caller, request_name, body_bytes)
+        return
+    if http_call.scheduled_request or not _reached_router(request):
+        return
+    raw_path = request.scope.get('path', '')
+    if (raw_path in _CALLER_USAGE_SKIPPED_PATHS or
+            raw_path.startswith(_CALLER_USAGE_SKIPPED_PREFIXES) or
+            _is_streaming_api(raw_path)):
+        return
+    route = request.scope.get('route')
+    if not isinstance(route, fastapi.routing.APIRoute):
+        return
+    path_params = request.scope.get('path_params') or {}
+    spanning = [
+        str(path_params.get(param, ''))
+        for param, convertor in route.param_convertors.items()
+        if isinstance(convertor, starlette.convertors.PathConvertor)
+    ]
+    name = (f'{request.method} ' +
+            caller_usage.route_template(raw_path, route.path_format, spanning))
+    caller_usage.record_execution(caller, name, caller_usage.KIND_HANDLER,
+                                  time.time() - start_time)
+    caller_usage.record_returned_bytes(caller, name, body_bytes)
 
 
 peak_rss_bytes = 0

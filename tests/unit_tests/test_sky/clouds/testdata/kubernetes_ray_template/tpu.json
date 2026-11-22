@@ -101,6 +101,14 @@
                   }
                 },
                 {
+                  "name": "TPU_NAME",
+                  "valueFrom": {
+                    "fieldRef": {
+                      "fieldPath": "metadata.name"
+                    }
+                  }
+                },
+                {
                   "name": "RAY_memory_monitor_refresh_ms",
                   "value": "0"
                 },
@@ -234,6 +242,7 @@
     "networking_mode": "portforward",
     "port_mode": "portforward",
     "region": "kubernetes",
+    "remote_identity_none": false,
     "services": [
       {
         "apiVersion": "v1",
