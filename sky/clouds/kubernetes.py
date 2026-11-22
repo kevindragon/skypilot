@@ -8,7 +8,8 @@ import subprocess
 import sys
 import tempfile
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import (Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple,
+                    Union)
 
 import colorama
 
@@ -22,17 +23,19 @@ from sky.clouds.utils import gcp_utils
 from sky.provision import instance_setup
 from sky.provision.gcp import constants as gcp_constants
 from sky.provision.kubernetes import fuse as kubernetes_fuse
-from sky.provision.kubernetes import host_network_probe
+from sky.provision.kubernetes import kai
 from sky.provision.kubernetes import network_utils
 from sky.provision.kubernetes import oci_nccl
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.utils import is_tpu_on_gke
 from sky.provision.kubernetes.utils import KubernetesHighPerformanceNetworkType
-from sky.provision.kubernetes.utils import normalize_tpu_accelerator_name
+from sky.provision.kubernetes.utils import normalize_tpu_accelerator
 from sky.skylet import constants
+from sky.users import permission
 from sky.utils import annotations
 from sky.utils import common
 from sky.utils import common_utils
+from sky.utils import config_utils
 from sky.utils import env_options
 from sky.utils import kubernetes_enums
 from sky.utils import registry
@@ -43,6 +46,7 @@ from sky.utils import volume as volume_lib
 
 if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
+    from sky import task as task_lib
 
 logger = sky_logging.init_logger(__name__)
 
@@ -193,6 +197,21 @@ def cap_preemption_hook_timeouts(
     return out
 
 
+def _match_remote_identity(remote_identity: Any,
+                           context: Optional[str]) -> Optional[str]:
+    """The identity for `context`; a dict maps context patterns (fnmatch)."""
+    if isinstance(remote_identity, dict):
+        remote_identity = next(
+            (sa_name for pattern, sa_name in remote_identity.items()
+             if fnmatch.fnmatchcase(context or '', str(pattern))), None)
+    # NONE is case-insensitive: a security setting must not silently become
+    # a service account named `none`.
+    none = schemas.RemoteIdentityOptions.NONE.value
+    if isinstance(remote_identity, str) and remote_identity.upper() == none:
+        return none
+    return remote_identity
+
+
 @registry.CLOUD_REGISTRY.register(aliases=['k8s'])
 class Kubernetes(clouds.Cloud):
     """Kubernetes."""
@@ -251,8 +270,8 @@ class Kubernetes(clouds.Cloud):
     # same contract. Do not change this string; instead repoint the same tag to
     # the new image (a new concrete datetag) in the catalog, so existing servers
     # pick up the update.
-    IMAGE_CPU = 'skypilot:custom-cpu-ubuntu-2204-v1'
-    IMAGE_GPU = 'skypilot:custom-gpu-ubuntu-2204-v1'
+    IMAGE_CPU = 'skypilot:custom-cpu-ubuntu-2204-v2'
+    IMAGE_GPU = 'skypilot:custom-gpu-ubuntu-2204-v2'
 
     PROVISIONER_VERSION = clouds.ProvisionerVersion.SKYPILOT
     STATUS_VERSION = clouds.StatusVersion.SKYPILOT
@@ -261,6 +280,254 @@ class Kubernetes(clouds.Cloud):
 
     # Set of contexts that has logged as temporarily unreachable
     logged_unreachable_contexts: Set[str] = set()
+
+    @classmethod
+    def _server_remote_identity(cls, context: Optional[str]) -> Optional[str]:
+        """The identity the server's own config gives this context."""
+        value = skypilot_config.get_server_workspace_region_config(
+            cloud='kubernetes',
+            region=context,
+            keys=('remote_identity',),
+            default_value=schemas.get_default_remote_identity('kubernetes'))
+        return _match_remote_identity(value, context)
+
+    @classmethod
+    def task_requests_none(
+            cls, context: Optional[str],
+            cluster_config_overrides: Optional[Dict[str, Any]]) -> bool:
+        """Whether the task's own config asks for `remote_identity: NONE`.
+
+        It beats every config layer, per-context values included: it only
+        takes credentials away, so no layer has a reason to keep them.
+        """
+        value = config_utils.get_cloud_config_value_from_dict(
+            dict_config=cluster_config_overrides or {},
+            cloud='kubernetes',
+            keys=('remote_identity',),
+            region=context,
+            default_value=None)
+        return (_match_remote_identity(
+            value, context) == schemas.RemoteIdentityOptions.NONE.value)
+
+    @classmethod
+    def remote_identity_is_none(cls, context: Optional[str],
+                                resources: 'resources_lib.Resources') -> bool:
+        """Whether pods launched for `resources` in `context` get no token."""
+        if isinstance(resources.kubernetes_identity, str):
+            return False
+        # An existing cluster: what its pods got, not what today's config says.
+        if isinstance(resources.remote_identity_none_at_launch, bool):
+            return resources.remote_identity_none_at_launch
+        none = schemas.RemoteIdentityOptions.NONE.value
+        if (cls._server_remote_identity(context) == none or
+                cls.task_requests_none(context,
+                                       resources.cluster_config_overrides)):
+            return True
+        merged = skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            region=context,
+            keys=('remote_identity',),
+            default_value=schemas.get_default_remote_identity('kubernetes'),
+            override_configs=resources.cluster_config_overrides)
+        return _match_remote_identity(merged, context) == none
+
+    @staticmethod
+    def uploads_kubeconfig(excluded_clouds: Iterable[clouds.Cloud]) -> bool:
+        """Whether the kubeconfig is uploaded with these clouds excluded.
+
+        Kubernetes and SSH share it. Same membership test as
+        sky_check.get_cloud_credential_file_mounts.
+        """
+        excluded = list(excluded_clouds)
+        return not all(
+            clouds.cloud_in_iterable(c, excluded)
+            for c in (Kubernetes(), clouds.SSH()))
+
+    @classmethod
+    def _refuse_loosening_kubeconfig_upload(
+            cls, cluster_config_overrides: Optional[Dict[str, Any]]) -> None:
+        """Raises if a non-admin's config would upload the API server's
+        kubeconfig where the server's own config would not.
+
+        Submit-time counterpart of the launch-time check in
+        backend_utils.write_cluster_config, which cannot tell the layers apart
+        on a controller.
+        """
+        lc = schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value
+        no_upload = schemas.RemoteIdentityOptions.NO_UPLOAD.value
+
+        def server_and_requested(
+                cloud: str, context: Optional[str],
+                overrides: Optional[Dict[str, Any]]) -> Tuple[Any, Any]:
+            default = schemas.get_default_remote_identity(cloud)
+            server = skypilot_config.get_server_workspace_region_config(
+                cloud=cloud,
+                region=context,
+                keys=('remote_identity',),
+                default_value=default)
+            requested = skypilot_config.get_effective_workspace_region_config(
+                cloud=cloud,
+                region=context,
+                keys=('remote_identity',),
+                default_value=default,
+                override_configs=overrides)
+            return (_match_remote_identity(server, context),
+                    _match_remote_identity(requested, context))
+
+        # Worded as the launch-time check in backend_utils words it.
+        refusal = None
+        # Clusters on another cloud get the kubeconfig unless NO_UPLOAD
+        # excludes it. As at launch, a task's own overrides do not count here.
+        both = {'kubernetes': cls(), 'ssh': clouds.SSH()}
+        values = {
+            cloud: server_and_requested(cloud, None, None) for cloud in both
+        }
+        if (not cls.uploads_kubeconfig(obj for cloud, obj in both.items()
+                                       if values[cloud][0] == no_upload) and
+                cls.uploads_kubeconfig(obj for cloud, obj in both.items()
+                                       if values[cloud][1] == no_upload)):
+            refusal = ('`remote_identity: NO_UPLOAD` is set for Kubernetes on '
+                       'the API server, so its kubeconfig is not uploaded to '
+                       'clusters; your config cannot override it.')
+        for cloud_cls in (cls, clouds.SSH):
+            if refusal is not None:
+                break
+            cloud = str(cloud_cls()).lower()
+            try:
+                contexts = cloud_cls.existing_allowed_contexts(silent=True)
+            except Exception:  # pylint: disable=broad-except
+                continue  # e.g. no kubernetes package: nothing to upload.
+            for context in contexts:
+                server, requested = server_and_requested(
+                    cloud, context, cluster_config_overrides)
+                if requested == lc and server != lc:
+                    refusal = (
+                        '`remote_identity: LOCAL_CREDENTIALS` would upload the '
+                        'API server\'s kubeconfig to your clusters on '
+                        f'{cloud} ({context}); only an admin can set it, in '
+                        'the API server\'s config.')
+                    break
+        if refusal is not None and not permission.caller_is_admin():
+            raise exceptions.InvalidCloudConfigs(refusal)
+
+    @classmethod
+    def check_request_keeps_server_identity(cls) -> None:
+        """Raises if the request's own config loosens a NONE the server's
+        config set for an allowed context, or uploads the server's kubeconfig
+        where the server's config does not.
+
+        For managed jobs and services, checked when they are submitted: the
+        request's config travels with them to their controller, which reads
+        it as its server config, so the loosened value would not be refused
+        there. Whatever the task's resources are, since that config applies to
+        every cluster the controller launches.
+        """
+        cls._refuse_loosening_kubeconfig_upload(None)
+        try:
+            contexts = cls.existing_allowed_contexts()
+        except Exception:  # pylint: disable=broad-except
+            return  # e.g. no kubernetes package: nothing to launch there.
+        none = schemas.RemoteIdentityOptions.NONE.value
+        for context in contexts:
+            if cls._server_remote_identity(context) != none:
+                continue
+            requested = _match_remote_identity(
+                skypilot_config.get_effective_workspace_region_config(
+                    cloud='kubernetes',
+                    region=context,
+                    keys=('remote_identity',),
+                    default_value=schemas.get_default_remote_identity(
+                        'kubernetes')), context)
+            if requested is not None:
+                cls._refuse_undoing_none(context, requested, {})
+
+    @classmethod
+    def check_task_keeps_server_identity(cls, task: 'task_lib.Task') -> None:
+        """Raises if every resource alternative of `task` would loosen a NONE
+        the server's config set, or if any would upload the server's
+        kubeconfig where the server's config does not.
+
+        For managed jobs and services, checked when they are submitted: their
+        cluster launch would be refused anyway, and the controller would retry
+        it forever instead of failing. An alternative that may land elsewhere
+        is left to the launch, which fails over to it. The kubeconfig check
+        is not: on a controller it is no longer refused at launch.
+        """
+        for resources in task.resources:
+            cls._refuse_loosening_kubeconfig_upload(
+                resources.cluster_config_overrides)
+        errors = []
+        for resources in task.resources:
+            try:
+                cls.check_resources_keep_server_none(resources)
+            except exceptions.InvalidCloudConfigs as e:
+                errors.append(e)
+                continue
+            return
+        if errors:
+            raise errors[0]
+
+    @classmethod
+    def check_resources_keep_server_none(
+            cls, resources: 'resources_lib.Resources') -> None:
+        """Raises if `resources`, pinned to Kubernetes, would loosen a NONE
+        the server's config set.
+
+        Unpinned resources are not checked: they may land on another cloud.
+        Without a context, any allowed context with a server NONE counts, even
+        if the launch might first pick one without it.
+        """
+        cloud = resources.cloud
+        if not isinstance(cloud, Kubernetes):
+            return
+        if isinstance(resources.kubernetes_identity, str):
+            return
+        if resources.region is not None:
+            contexts: List[Optional[str]] = [resources.region]
+        else:
+            try:
+                contexts = list(type(cloud).existing_allowed_contexts())
+            except Exception:  # pylint: disable=broad-except
+                # e.g. no kubernetes package: the launch reports it.
+                return
+        none = schemas.RemoteIdentityOptions.NONE.value
+        overrides = resources.cluster_config_overrides
+        for context in contexts:
+            if cls._server_remote_identity(context) != none:
+                continue
+            if cls.task_requests_none(context, overrides):
+                requested: Optional[str] = none
+            else:
+                requested = _match_remote_identity(
+                    skypilot_config.get_effective_workspace_region_config(
+                        cloud='kubernetes',
+                        region=context,
+                        keys=('remote_identity',),
+                        default_value=schemas.get_default_remote_identity(
+                            'kubernetes'),
+                        override_configs=overrides), context)
+            if requested is not None:
+                cls._refuse_undoing_none(context, requested, overrides)
+
+    @classmethod
+    def _refuse_undoing_none(cls, context: Optional[str], requested: str,
+                             cluster_config_overrides: Dict[str, Any]) -> None:
+        """Raises if anything would hand a NONE pod an identity after all."""
+        none = schemas.RemoteIdentityOptions.NONE.value
+        prefix = ('`remote_identity: NONE` is set for Kubernetes context '
+                  f'{context!r}')
+        if requested != none:
+            raise exceptions.InvalidCloudConfigs(
+                f'{prefix} on the API server; `remote_identity: '
+                f'{requested}` from your config or task cannot override it.')
+        spec = (kubernetes_utils.resolve_effective_pod_config(
+            cluster_config_overrides, cls(), context).get('spec') or {})
+        conflicts = kubernetes_utils.pod_spec_identity_conflicts(spec)
+        if conflicts:
+            raise exceptions.InvalidCloudConfigs(
+                f'{prefix}, so pods get no API credentials, but '
+                f'{", ".join(conflicts)} would give them some. Remove it, or '
+                'use another remote_identity.')
 
     @classmethod
     def _unsupported_features_for_resources(
@@ -281,6 +548,14 @@ class Kubernetes(clouds.Cloud):
         unsupported_features[clouds.CloudImplementationFeatures.AUTOSTOP] = (
             'Auto-stop is not supported on Kubernetes.')
         for context in contexts:
+            if cls.remote_identity_is_none(context, resources):
+                unsupported_features[
+                    clouds.CloudImplementationFeatures.AUTODOWN] = (
+                        'Autodown needs the pod to delete itself through the '
+                        'Kubernetes API, and `remote_identity: NONE` '
+                        f'(context {context!r}) gives it no credentials. '
+                        'Tear the cluster down with `sky down`, or use another '
+                        'remote_identity.')
             # Allow spot instances if supported by the cluster
             try:
                 # Run spot label check and network type detection concurrently
@@ -308,6 +583,14 @@ class Kubernetes(clouds.Cloud):
                             CUSTOM_NETWORK_TIER, None)
             except exceptions.KubeAPIUnreachableError as e:
                 cls._log_unreachable_context(context, str(e))
+                # Unknown is not unsupported: the node-fit check in
+                # regions_with_offering() reports the context as unreachable,
+                # and provisioning checks the features again.
+                unsupported_features.pop(
+                    clouds.CloudImplementationFeatures.SPOT_INSTANCE, None)
+                unsupported_features.pop(
+                    clouds.CloudImplementationFeatures.CUSTOM_NETWORK_TIER,
+                    None)
         return unsupported_features
 
     @classmethod
@@ -340,8 +623,9 @@ class Kubernetes(clouds.Cloud):
         all_contexts = kubernetes_utils.get_all_kube_context_names()
         if not all_contexts:
             return []
-
-        all_contexts = set(all_contexts)
+        # Dedupe in kubeconfig order: the in-cluster name can repeat a
+        # kubeconfig context.
+        all_contexts = list(dict.fromkeys(all_contexts))
 
         # Allowed_contexts specified for workspace should take precedence over
         # the global allowed_contexts.
@@ -454,7 +738,18 @@ class Kubernetes(clouds.Cloud):
         region: Optional[str],
         zone: Optional[str],
         resources: Optional['resources_lib.Resources'] = None,
+        *,
+        unreachable_errors: Optional[List[Exception]] = None,
     ) -> List[clouds.Region]:
+        """See Cloud.regions_with_offering.
+
+        Args:
+            unreachable_errors: If given, gets one KubeAPIUnreachableError for
+                each context that was skipped because of a failure that may
+                pass (connection error, timeout, 429 or 5xx). A context that
+                fails for any other reason, e.g. it rejects the credentials or
+                its kubeconfig entry is invalid, is not included.
+        """
         del accelerators, zone, use_spot  # unused
         existing_contexts = cls.existing_allowed_contexts()
 
@@ -478,6 +773,15 @@ class Kubernetes(clouds.Cloud):
                     continue
             regions = filtered_regions
 
+        tpu_multi_host_shape = None
+        if resources is not None and resources.accelerators and len(
+                resources.accelerators) == 1:
+            acc, acc_count = next(iter(resources.accelerators.items()))
+            tpu_multi_host_shape = kubernetes_utils.get_tpu_multi_host_shape(
+                acc, acc_count,
+                kubernetes_utils.multi_host_requested(
+                    resources.accelerator_args))
+
         # Check if requested instance type will fit in the cluster.
         # TODO(zhwu,romilb): autoscaler type needs to be regional (per
         # kubernetes cluster/context).
@@ -495,12 +799,22 @@ class Kubernetes(clouds.Cloud):
                 ephemeral_storage_gb = (resources.disk_size
                                         if resources is not None and
                                         resources.disk_size_specified else None)
+                fit_kwargs = ({
+                    'tpu_multi_host_shape': tpu_multi_host_shape
+                } if tpu_multi_host_shape is not None else {})
                 fits, reason = kubernetes_utils.check_instance_fits(
                     context,
                     instance_type,
-                    ephemeral_storage_gb=ephemeral_storage_gb)
+                    ephemeral_storage_gb=ephemeral_storage_gb,
+                    **fit_kwargs)
             except exceptions.KubeAPIUnreachableError as e:
                 cls._log_unreachable_context(context, str(e))
+                if (unreachable_errors is not None and
+                        kubernetes_utils.is_transient_api_error(e.__cause__)):
+                    unreachable_errors.append(
+                        exceptions.KubeAPIUnreachableError(
+                            f'Kubernetes context {context!r} is unreachable: '
+                            f'{e}'))
                 continue
             if fits:
                 regions_to_return.append(r)
@@ -539,7 +853,9 @@ class Kubernetes(clouds.Cloud):
                 kubernetes_enums.KubernetesAutoscalerType(autoscaler_type))
             logger.debug(f'{context} has autoscaler of type: {autoscaler_type}')
             if autoscaler.can_create_new_instance_of_type(
-                    context, instance_type):
+                    context, instance_type,
+                    *((tpu_multi_host_shape,)
+                      if tpu_multi_host_shape is not None else ())):
                 logger.debug(f'Kubernetes cluster {context} can be '
                              'autoscaled to create instance type '
                              f'{instance_type}. Including {context} '
@@ -760,8 +1076,18 @@ class Kubernetes(clouds.Cloud):
         # Optionally populate accelerator information.
         acc_type = k.accelerator_type
         acc_count = k.accelerator_count
+        tpu_multi_host_shape = None
         if acc_type is not None and is_tpu_on_gke(acc_type):
-            acc_type, acc_count = normalize_tpu_accelerator_name(acc_type)
+            tpu_multi_host_shape = kubernetes_utils.get_tpu_multi_host_shape(
+                acc_type, acc_count,
+                kubernetes_utils.multi_host_requested(
+                    resources.accelerator_args))
+            acc_type, acc_count = normalize_tpu_accelerator(acc_type, acc_count)
+            if tpu_multi_host_shape is not None:
+                # One pod per VM of the slice, each taking all of its VM's
+                # chips; the cluster has one pod per VM per slice (see
+                # kubernetes_utils.tpu_vms_per_slice()).
+                acc_count = tpu_multi_host_shape.chips_per_vm
         else:
             acc_count = acc_count or 0
 
@@ -801,7 +1127,19 @@ class Kubernetes(clouds.Cloud):
         avoid_label_keys = None
 
         # If GPU/TPUs are requested, set node label to match the GPU/TPU type.
-        if acc_count > 0 and acc_type is not None:
+        tpu_chips_per_vm = None
+        if tpu_multi_host_shape is not None:
+            # A multi-host slice is selected by its type, its whole-slice
+            # topology and the chips on each VM.
+            k8s_acc_label_key = kubernetes_utils.GKELabelFormatter.TPU_LABEL_KEY
+            k8s_acc_label_values = [tpu_multi_host_shape.accelerator]
+            k8s_topology_label_key = (
+                kubernetes_utils.GKELabelFormatter.TPU_TOPOLOGY_LABEL_KEY)
+            k8s_topology_label_value = tpu_multi_host_shape.topology
+            tpu_chips_per_vm = tpu_multi_host_shape.chips_per_vm
+            tpu_requested = True
+            k8s_resource_key = kubernetes_utils.TPU_RESOURCE_KEY
+        elif acc_count > 0 and acc_type is not None:
             (k8s_acc_label_key, k8s_acc_label_values, k8s_topology_label_key,
              k8s_topology_label_value) = (
                  kubernetes_utils.get_accelerator_label_key_values(
@@ -843,25 +1181,21 @@ class Kubernetes(clouds.Cloud):
             default_value=schemas.get_default_remote_identity('kubernetes'),
             override_configs=resources.cluster_config_overrides)
 
-        if isinstance(remote_identity, dict):
-            # If remote_identity is a dict, match the current context against
-            # patterns using fnmatch (consistent with AWS/GCP behavior).
-            k8s_service_account_name = None
-            for pattern, sa_name in remote_identity.items():
-                if fnmatch.fnmatchcase(context, str(pattern)):
-                    k8s_service_account_name = sa_name
-                    break
-            if k8s_service_account_name is None:
-                err_msg = (f'Context {context!r} not found in '
-                           'remote identities from config.yaml')
-                raise ValueError(err_msg)
-        else:
-            # If remote_identity is not a dict, use
-            k8s_service_account_name = remote_identity
-
         lc = schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value
         sa = schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value
         no_upload = schemas.RemoteIdentityOptions.NO_UPLOAD.value
+        none = schemas.RemoteIdentityOptions.NONE.value
+
+        if self.task_requests_none(context, resources.cluster_config_overrides):
+            # A per-context value would otherwise beat the task's NONE.
+            k8s_service_account_name: Optional[str] = none
+        else:
+            k8s_service_account_name = _match_remote_identity(
+                remote_identity, context)
+        if k8s_service_account_name is None:
+            err_msg = (f'Context {context!r} not found in '
+                       'remote identities from config.yaml')
+            raise ValueError(err_msg)
 
         # A controller cluster provisions other clusters, so its pod needs
         # cluster-scoped permissions no pod running user code should hold.
@@ -871,11 +1205,40 @@ class Kubernetes(clouds.Cloud):
         # This makes check_cluster_name_not_controller() (controller_utils)
         # load-bearing for a permission boundary: it is what stops a user
         # launching `sky-jobs-controller-mine` to be handed this identity.
-        # Relaxing that guard would turn into privilege escalation -- see the
-        # test in tests/unit_tests/kubernetes/.
+        # Relaxing that guard, or letting a request skip it
+        # (`_disable_controller_check` is in-process only), would turn into
+        # privilege escalation -- see test_kubernetes_ray_template_snapshot.py
+        # and test_payloads.py under tests/unit_tests/test_sky/.
         is_controller = common.is_controller_name(cluster_name.display_name)
 
-        if k8s_service_account_name in (lc, sa, no_upload):
+        # NONE set by the server holds even when the requester's layer says
+        # otherwise; the check below refuses that rather than obeying it.
+        identity_none = (k8s_service_account_name == none or
+                         self._server_remote_identity(context) == none)
+        if isinstance(resources.kubernetes_identity, str):
+            # A cluster SkyPilot launches for itself with a fixed account
+            # (execution.launch's _kubernetes_identity), never user code.
+            k8s_service_account_name = resources.kubernetes_identity
+            identity_none = False
+            is_controller = False
+        elif identity_none and is_controller:
+            # A controller provisions clusters and needs its identity; NONE
+            # still reaches the clusters it launches, through the user's config.
+            logger.info(f'Ignoring `remote_identity: NONE` (context '
+                        f'{context!r}) for controller '
+                        f'{cluster_name.display_name!r}: it needs an identity '
+                        'to provision clusters.')
+            identity_none = False
+            k8s_service_account_name = (
+                kubernetes_utils.CONTROLLER_SERVICE_ACCOUNT_NAME)
+        elif identity_none:
+            self._refuse_undoing_none(context, k8s_service_account_name,
+                                      resources.cluster_config_overrides)
+            # Same account name as SERVICE_ACCOUNT, so imagePullSecrets on it
+            # keep working; it gets no token and no roles.
+            k8s_service_account_name = (
+                kubernetes_utils.DEFAULT_SERVICE_ACCOUNT_NAME)
+        elif k8s_service_account_name in (lc, sa, no_upload):
             # Use the default service account if remote identity is not set.
             # For LOCAL_CREDENTIALS, this is for in-cluster authentication
             # which needs a serviceaccount (specifically for SSH node pools
@@ -906,7 +1269,7 @@ class Kubernetes(clouds.Cloud):
 
         network_type, metadata = self._detect_network_type(
             context, resources.network_tier, k8s_acc_label_key,
-            k8s_resource_key, acc_count, acc_type)
+            k8s_resource_key, acc_count, acc_type, k8s_acc_label_values)
         oci_roce_enabled = (
             network_type == KubernetesHighPerformanceNetworkType.OCI_ROCE)
         # The NCCL profile picked below depends on it: a pod holding SR-IOV
@@ -962,6 +1325,46 @@ class Kubernetes(clouds.Cloud):
                 cloud='kubernetes',
                 region=context,
                 override_configs=resources.cluster_config_overrides))
+        k8s_kai_queue_name = skypilot_config.get_effective_kai_value(
+            'queue',
+            region=context,
+            override_configs=resources.cluster_config_overrides)
+        k8s_kai_preemptibility = skypilot_config.get_effective_kai_value(
+            'preemptibility',
+            region=context,
+            override_configs=resources.cluster_config_overrides)
+        if k8s_kai_queue_name is not None and (k8s_kueue_local_queue_name
+                                               is not None):
+            raise ValueError(f'Context {context} sets both a KAI queue '
+                             f'({k8s_kai_queue_name!r}) and a Kueue queue '
+                             f'({k8s_kueue_local_queue_name!r}); set only one.')
+        if k8s_kai_preemptibility is not None and k8s_kai_queue_name is None:
+            raise ValueError(
+                f'kubernetes.kai.preemptibility is set for context {context} '
+                'without kubernetes.kai.queue.')
+        k8s_kai_topology = skypilot_config.get_effective_kai_value(
+            'topology',
+            region=context,
+            override_configs=resources.cluster_config_overrides)
+        k8s_kai_required_level = skypilot_config.get_effective_kai_value(
+            'required_topology_level',
+            region=context,
+            override_configs=resources.cluster_config_overrides)
+        k8s_kai_preferred_level = skypilot_config.get_effective_kai_value(
+            'preferred_topology_level',
+            region=context,
+            override_configs=resources.cluster_config_overrides)
+        has_topology_level = (k8s_kai_required_level is not None or
+                              k8s_kai_preferred_level is not None)
+        if k8s_kai_topology is not None and k8s_kai_queue_name is None:
+            raise ValueError(
+                f'kubernetes.kai.topology is set for context {context} '
+                'without kubernetes.kai.queue.')
+        if (k8s_kai_topology is not None) != has_topology_level:
+            raise ValueError(
+                f'Context {context} must set kubernetes.kai.topology together '
+                'with kubernetes.kai.required_topology_level or '
+                'kubernetes.kai.preferred_topology_level.')
 
         # Check DWS configuration for GKE.
         (enable_flex_start, enable_flex_start_queued_provisioning,
@@ -991,7 +1394,8 @@ class Kubernetes(clouds.Cloud):
         # scheduling 100s of pods.
         # We use a linear scaling formula to determine the timeout based on the
         # number of nodes.
-        is_using_kueue = k8s_kueue_local_queue_name is not None
+        is_using_queueing = (k8s_kueue_local_queue_name is not None or
+                             k8s_kai_queue_name is not None)
         # auto_mounts volumes are injected later, in write_cluster_config(), so
         # they never reach volume_mounts. Resolve them here as well, or an
         # auto-mounted ReadWriteMany volume would be held to the base timeout
@@ -1001,7 +1405,7 @@ class Kubernetes(clouds.Cloud):
             num_nodes,
             volume_mounts,
             enable_flex_start or enable_flex_start_queued_provisioning,
-            is_using_kueue,
+            is_using_queueing,
             auto_mounts=auto_mounts)
 
         # Use _REPR, instead of directly using 'kubernetes' as the config key,
@@ -1178,12 +1582,10 @@ class Kubernetes(clouds.Cloud):
                                          k8s_rdma_nic_count)
 
         if k8s_host_network:
-            cluster_name_on_cloud = cluster_name.name_on_cloud
+            # The port values themselves are written into the pod spec per pod
+            # (host_network_ports), not templated here: they are assigned once
+            # the existing pods are known, which this render cannot see.
             k8s_env_vars['SKYPILOT_HOST_NETWORK'] = '1'
-            k8s_env_vars['SKYPILOT_RAY_PORTS_CONFIGMAP_NAME'] = (
-                host_network_probe.ray_ports_configmap_name(
-                    cluster_name_on_cloud))
-            k8s_env_vars['SKYPILOT_RAY_PORTS_CONFIGMAP_NAMESPACE'] = namespace
 
         deploy_vars = {
             'instance_type': resources.instance_type,
@@ -1198,18 +1600,34 @@ class Kubernetes(clouds.Cloud):
             'k8s_port_mode': port_mode.value,
             'k8s_acc_label_key': k8s_acc_label_key,
             'k8s_acc_label_values': k8s_acc_label_values,
-            'k8s_node_affinity': kubernetes_utils.get_node_affinity(
-                k8s_acc_label_key, k8s_acc_label_values, avoid_label_keys),
+            # Merged into the rendered pod by write_cluster_config().
+            'pod_fields': kubernetes_utils.get_pod_fields(
+                acc_label_key=k8s_acc_label_key,
+                acc_label_values=k8s_acc_label_values,
+                avoid_label_keys=avoid_label_keys,
+                topology_label_key=k8s_topology_label_key,
+                topology_label_value=k8s_topology_label_value,
+                spot_label_key=spot_label_key,
+                spot_label_value=spot_label_value,
+                enable_flex_start=enable_flex_start,
+                tpu_chips_per_vm=tpu_chips_per_vm),
             'k8s_service_account_name': k8s_service_account_name,
             # Gates the provisioner-only roles: only a controller pod
             # provisions, and only in non-consolidation deployments --
             # under consolidation the controllers are API-server
             # processes and no pod needs them at all.
             'k8s_is_controller': is_controller,
-            'k8s_automount_sa_token': 'true',
+            'k8s_automount_sa_token': 'false' if identity_none else 'true',
+            'k8s_remote_identity_none': identity_none,
             'k8s_fuse_device_required': fuse_device_required,
             'k8s_kueue_local_queue_name': k8s_kueue_local_queue_name,
             'k8s_kueue_admission_timeout': k8s_kueue_admission_timeout,
+            'k8s_kai_queue_name': k8s_kai_queue_name,
+            'k8s_kai_preemptibility': k8s_kai_preemptibility,
+            'k8s_kai_topology': k8s_kai_topology,
+            'k8s_kai_required_topology_level': k8s_kai_required_level,
+            'k8s_kai_preferred_topology_level': k8s_kai_preferred_level,
+            'k8s_kai_scheduler_name': kai.SCHEDULER_NAME,
             # Namespace to run the fusermount-server daemonset in
             'k8s_skypilot_system_namespace': _SKYPILOT_SYSTEM_NAMESPACE,
             'k8s_fusermount_shared_dir': kubernetes_fuse.FUSERMOUNT_SHARED_DIR,
@@ -1217,17 +1635,13 @@ class Kubernetes(clouds.Cloud):
                 kubernetes_fuse.get_fusermount_shim_setup_command(
                     sudo_cmd='$(prefix_cmd)',
                     shared_dir=kubernetes_fuse.FUSERMOUNT_SHARED_DIR),
-            'k8s_spot_label_key': spot_label_key,
-            'k8s_spot_label_value': spot_label_value,
             'tpu_requested': tpu_requested,
-            'k8s_topology_label_key': k8s_topology_label_key,
-            'k8s_topology_label_value': k8s_topology_label_value,
             'k8s_resource_key': k8s_resource_key,
             'k8s_env_vars': k8s_env_vars,
             'image_id': image_id,
-            'ray_installation_commands': constants.RAY_INSTALLATION_COMMANDS,
-            'ray_patches_cmd': instance_setup.ray_patches_cmd(
-                constants.SKY_REMOTE_RAY_VERSION),
+            # 'ray_installation_commands' and 'ray_patches_cmd' are filled in by
+            # backend_utils.write_cluster_config: both depend on the Ray version
+            # this particular cluster is pinned to, which is not known here.
             'ray_head_start_command': instance_setup.ray_head_start_command(
                 custom_resources, custom_ray_options),
             'skypilot_ray_port': constants.SKY_REMOTE_RAY_PORT,
@@ -1252,11 +1666,13 @@ class Kubernetes(clouds.Cloud):
                 constants.SKY_UNSET_PYTHONPATH_AND_SET_CWD,
             'k8s_high_availability_storage_class_name':
                 (k8s_ha_storage_class_name),
-            'avoid_label_keys': avoid_label_keys,
-            'k8s_enable_flex_start': enable_flex_start,
             'k8s_max_run_duration_seconds': max_run_duration_seconds,
             'k8s_network_type': network_type.value,
             'k8s_context': context,
+            # Uncached: a context can be re-pointed without a kubeconfig change.
+            'k8s_cluster_uid':
+                (None if dryrun else kubernetes_utils.get_cluster_uid(
+                    context, use_cache=False)),
             'k8s_namespace': namespace,
             'k8s_host_network': k8s_host_network,
             'k8s_rdma_host_device_access': k8s_rdma_host_device_access,
@@ -1386,6 +1802,7 @@ class Kubernetes(clouds.Cloud):
         # (context) that has enough resources.
         self._warn_on_disk_tier(resources)
         fuzzy_candidate_list: List[str] = []
+        unreachable_errors: List[Exception] = []
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             regions = self.regions_with_offering(
@@ -1394,9 +1811,11 @@ class Kubernetes(clouds.Cloud):
                 use_spot=resources.use_spot,
                 region=resources.region,
                 zone=resources.zone,
-                resources=resources)
+                resources=resources,
+                unreachable_errors=unreachable_errors)
             if not regions:
-                return resources_utils.FeasibleResources([], [], None)
+                return resources_utils.FeasibleResources(
+                    [], [], None, unreachable_errors=unreachable_errors)
             resources = resources.copy(accelerators=None)
             return resources_utils.FeasibleResources([resources],
                                                      fuzzy_candidate_list, None)
@@ -1442,8 +1861,29 @@ class Kubernetes(clouds.Cloud):
                                  from_instance_type(default_instance_type))
 
             gpu_task_cpus = k8s_instance_type.cpus
+            per_pod_acc_count = acc_count
+            if kubernetes_utils.is_tpu_on_gke(acc_type):
+                normalized, chips = kubernetes_utils.normalize_tpu_accelerator(
+                    acc_type, acc_count)
+                if normalized != acc_type and acc_count > 1:
+                    # tpu-v6e-16 names one 16-chip slice; a count after it
+                    # is ambiguous (use num_nodes for several slices).
+                    return resources_utils.FeasibleResources(
+                        [], [], f'{acc_type}:{acc_count} is not supported on '
+                        f'Kubernetes: {acc_type} already names a slice of '
+                        f'{chips} chips. Use num_nodes to request several '
+                        'slices.')
+                shape = kubernetes_utils.get_tpu_multi_host_shape(
+                    acc_type, acc_count,
+                    kubernetes_utils.multi_host_requested(
+                        resources.accelerator_args))
+                if shape is not None:
+                    # A multi-host slice runs one pod per VM; size each pod
+                    # for its VM's chips.
+                    per_pod_acc_count = shape.chips_per_vm
             if resources.cpus is None:
-                gpu_task_cpus = self._DEFAULT_NUM_VCPUS_WITH_GPU * acc_count
+                gpu_task_cpus = (self._DEFAULT_NUM_VCPUS_WITH_GPU *
+                                 per_pod_acc_count)
             # Special handling to bump up memory multiplier for GPU instances
             gpu_task_memory = (float(resources.memory.strip('+')) if
                                resources.memory is not None else gpu_task_cpus *
@@ -1458,9 +1898,11 @@ class Kubernetes(clouds.Cloud):
             use_spot=resources.use_spot,
             region=resources.region,
             zone=resources.zone,
-            resources=resources)
+            resources=resources,
+            unreachable_errors=unreachable_errors)
         if not available_regions:
-            return resources_utils.FeasibleResources([], [], None)
+            return resources_utils.FeasibleResources(
+                [], [], None, unreachable_errors=unreachable_errors)
         # No fuzzy lists for Kubernetes
         # We don't set the resources returned with regions, because the
         # optimizer will further find the valid region (context) for the
@@ -1508,6 +1950,18 @@ class Kubernetes(clouds.Cloud):
             cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
         """Checks if the user has access credentials to
         Kubernetes."""
+        return cls.check_contexts_compute_credentials(None)
+
+    @classmethod
+    def check_contexts_compute_credentials(
+        cls, contexts: Optional[List[str]]
+    ) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+        """Checks compute access to `contexts`, or to every allowed context.
+
+        Returns whether any checked context is usable, and a dict mapping each
+        checked context to its status, or a string reason when the check
+        cannot run. An empty `contexts` checks no context.
+        """
         # Check for port forward dependencies
         logger.debug(f'Checking compute credentials for {cls.canonical_name()}')
         reasons = kubernetes_utils.check_port_forward_mode_dependencies(False)
@@ -1517,26 +1971,27 @@ class Kubernetes(clouds.Cloud):
                 [f'{cls._INDENT_PREFIX}' + r for r in reasons[1:]])
             return (False, formatted)
 
-        # Test using python API
-        try:
-            existing_allowed_contexts = cls.existing_allowed_contexts()
-        except ImportError as e:
-            return (False,
-                    f'{common_utils.format_exception(e, use_bracket=True)}')
-        if not existing_allowed_contexts:
-            if skypilot_config.loaded_config_path() is None:
-                check_skypilot_config_msg = ''
-            else:
-                check_skypilot_config_msg = (
-                    ' and check "allowed_contexts" in your '
-                    f'{skypilot_config.loaded_config_path()} file.')
-            return (False, 'No available context found in kubeconfig. '
-                    'Check if you have a valid kubeconfig file' +
-                    check_skypilot_config_msg)
+        if contexts is None:
+            # Test using python API
+            try:
+                contexts = cls.existing_allowed_contexts()
+            except ImportError as e:
+                return (False,
+                        f'{common_utils.format_exception(e, use_bracket=True)}')
+            if not contexts:
+                if skypilot_config.loaded_config_path() is None:
+                    check_skypilot_config_msg = ''
+                else:
+                    check_skypilot_config_msg = (
+                        ' and check "allowed_contexts" in your '
+                        f'{skypilot_config.loaded_config_path()} file.')
+                return (False, 'No available context found in kubeconfig. '
+                        'Check if you have a valid kubeconfig file' +
+                        check_skypilot_config_msg)
 
         ctx2text = {}
         success = False
-        for context in existing_allowed_contexts:
+        for context in contexts:
             suc, text = cls._check_single_context(context)
             success = success or suc
             ctx2text[context] = text
@@ -1610,10 +2065,12 @@ class Kubernetes(clouds.Cloud):
         all_contexts = kubernetes_utils.get_all_kube_context_names()
 
         if region and region not in all_contexts:
+            # List only the contexts this caller may use, not the whole
+            # kubeconfig.
             raise ValueError(
                 f'Context {region} not found in kubeconfig. Kubernetes only '
                 'supports context names as regions. Available '
-                f'contexts: {all_contexts}')
+                f'contexts: {self.existing_allowed_contexts(silent=True)}')
         if zone is not None:
             raise ValueError('Kubernetes support does not support setting zone.'
                              ' Cluster used is determined by the kubeconfig.')
@@ -1871,6 +2328,7 @@ class Kubernetes(clouds.Cloud):
         k8s_resource_key: Optional[str] = None,
         acc_count: Optional[int] = None,
         acc_type: Optional[str] = None,
+        k8s_acc_label_values: Optional[List[str]] = None,
     ) -> Tuple[KubernetesHighPerformanceNetworkType, Optional[Dict[str, Any]]]:
         """Detect the type of Kubernetes network based on node labels.
 
@@ -1884,6 +2342,10 @@ class Kubernetes(clouds.Cloud):
             acc_type: The accelerator type requested (e.g. 'H100'). Used to
                 derive the EFA interface count on AWS scale-from-zero clusters
                 where no GPU+EFA node is running to scan.
+            k8s_acc_label_values: The accelerator label values the pod's
+                required node affinity pins to. A warm node whose label value
+                is not one of them can never host the pod, so it is not used
+                to size EFA.
 
         Returns:
             A tuple of (network_type, metadata).
@@ -1945,6 +2407,15 @@ class Kubernetes(clouds.Cloud):
                                     int(node.status.
                                         allocatable[k8s_resource_key]) <
                                     acc_count):
+                                continue
+                            # Same node set the pod's affinity pins to: the
+                            # label key alone doesn't mean the node runs the
+                            # requested accelerator, so an L4:8 request with a
+                            # warm p5 would otherwise derive 32 EFA interfaces
+                            # for a pod that can never land there.
+                            if (k8s_acc_label_values is not None and
+                                    node.metadata.labels[k8s_acc_label_key]
+                                    not in k8s_acc_label_values):
                                 continue
                             # Calculate EFA count proportionally
                             if AWS_EFA_RESOURCE_KEY in node.status.allocatable:

@@ -16,7 +16,7 @@ from prometheus_client import generate_latest
 from prometheus_client import multiprocess
 import prometheus_client as prom
 import psutil
-import starlette.middleware.base
+import starlette.convertors
 import starlette.types
 import uvicorn
 
@@ -27,6 +27,8 @@ from sky import skypilot_config
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.jobs import stall
 from sky.metrics import utils as metrics_utils
+from sky.provision.kubernetes import utils as kubernetes_utils
+from sky.server import caller_usage
 from sky.server import constants as server_constants
 from sky.server import container_memory
 from sky.server import local_disk
@@ -1079,8 +1081,10 @@ def _label_or_default(value: Optional[str], default: str) -> str:
 _EMERGENCY_EPISODES_MAX_SERIES = 100
 
 _RECOVERY_EVENTS_HELP = (
-    'Count of managed-job RECOVERING events currently retained in '
-    'job_events, by recovery source and workspace. NOT monotone: '
+    'Count of managed-job recovery events currently retained in '
+    'job_events, by recovery source and workspace: every RECOVERING event, '
+    'plus the RUNNING events of emergency recoveries that kept the job on '
+    'its cluster instead of relaunching it. NOT monotone: '
     'job_events has a retention window, so aged-out rows decrease the '
     'value — use clamp_min(delta(...), 0) for rates, never increase(). '
     'Events written before recovery_source existed (NULL) are excluded.')
@@ -1112,8 +1116,10 @@ class ManagedJobsCollector:
     Also emits two recovery-observability gauges:
 
     * ``sky_managed_job_recovery_events_count{recovery_source,
-      workspace}`` — RECOVERING ``job_events`` rows currently retained,
-      by source (FAILURE / EMERGENCY / RESTART). Not monotone (event
+      workspace}`` — recovery ``job_events`` rows currently retained
+      (RECOVERING, plus RUNNING / WINDING_DOWN rows tagged EMERGENCY by an
+      emergency recovery that kept the job on its cluster), by source
+      (FAILURE / EMERGENCY / RESTART). Not monotone (event
       retention prunes old rows), so rate queries must use
       ``clamp_min(delta(...), 0)``, never ``increase(...)``.
     * ``sky_managed_job_emergency_recovery_attempts{job_id, job_name,
@@ -1523,6 +1529,12 @@ class WorkspaceUsageCollector:
             if launched_resources is None:
                 continue
             num_nodes = max(1, int(getattr(handle, 'launched_nodes', 1) or 1))
+            # launched_resources describes one task node; a multi-host TPU
+            # slice on Kubernetes has several cluster nodes (pods) per task
+            # node.
+            num_nodes = max(
+                1, kubernetes_utils.num_task_nodes(num_nodes,
+                                                   launched_resources))
 
             accelerators = (launched_resources.accelerators or {})
             for acc_name, acc_count in accelerators.items():
@@ -1787,11 +1799,16 @@ class _FederationTargets:
         central Prometheus scrapes the local cluster's exporters directly, so
         federating them again would only duplicate the raw series under a
         stamped copy. The dashboard matches the local cluster with cluster=""
-        (see /dashboard_config local_contexts).
+        (see /dashboard_config local_contexts). Contexts known to be
+        unreachable are dropped too, before the local-cluster check probes
+        them.
         """
         skypilot_config.reload_config()
         annotations.clear_request_level_cache()
-        contexts = core.get_all_contexts()
+        contexts = [
+            ctx for ctx in core.get_all_contexts()
+            if kubernetes_utils.known_unreachable_reason(ctx) is None
+        ]
         _, remote_contexts = metrics_utils.split_local_remote_contexts(contexts)
         # Slurm clusters federate through their login node; only clusters
         # with a configured prometheus_url participate. Enumeration reads
@@ -2332,7 +2349,7 @@ def _unrouted_path_label(path: str, literal_routes: FrozenSet[str]) -> str:
     return OTHER_PATH_LABEL
 
 
-class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
+class PrometheusMiddleware:
     """Middleware to collect Prometheus metrics for HTTP requests.
 
     Registered as the OUTERMOST middleware (added last in
@@ -2351,16 +2368,17 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     stamped a reason (`middleware_utils.mark_rejection`), the response is
     also counted in `sky_apiserver_request_rejections_total`.
 
-    Duration is measured from entry into this layer, i.e. it includes the
-    time the authentication middlewares spend (DB lookups under their
-    deadline): it is the latency the client observed.
+    Duration is measured from entry into this layer to the start of the
+    response, i.e. it includes the time the authentication middlewares spend
+    (DB lookups under their deadline) but not the time spent streaming the
+    body: it is the latency until the client sees the response headers.
 
-    WebSocket scopes pass straight through, as for every BaseHTTPMiddleware;
-    refused handshakes are counted by `middleware_utils.websocket_aware`.
+    WebSocket scopes pass straight through; refused handshakes are counted by
+    `middleware_utils.websocket_aware`.
     """
 
     def __init__(self, app: starlette.types.ASGIApp):
-        super().__init__(app)
+        self.app = app
         # (route count, literal route paths) of the app, rebuilt if routes
         # were added since. Routes are all registered before the first
         # request in practice; the count check keeps the memo honest anyway.
@@ -2373,27 +2391,50 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             self._literal_routes = (count, _literal_route_paths(app))
         return self._literal_routes[1]
 
-    async def dispatch(self, request: fastapi.Request, call_next):
+    async def __call__(self, scope: starlette.types.Scope,
+                       receive: starlette.types.Receive,
+                       send: starlette.types.Send) -> None:
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+        request = fastapi.Request(scope, receive)
         logger.debug(f'PROM Middleware Request: {request}, {request.url.path}')
         start_time = time.time()
         method = request.method
-        status_code = 0
+        recorded = False
+        http_call, http_call_token = caller_usage.begin_http_call()
 
+        def record(status_code: int, body_bytes: Optional[int]) -> None:
+            nonlocal recorded
+            recorded = True
+            # This layer is outermost, so it sees 100% of responses: a
+            # recording fault must not turn a served request into a 500.
+            middleware_utils.record_safely('request', self._record, request,
+                                           method, status_code, start_time)
+            middleware_utils.record_safely('caller usage', _record_caller_usage,
+                                           request, http_call, start_time,
+                                           body_bytes)
+
+        async def send_and_record(message: starlette.types.Message) -> None:
+            if message['type'] == 'http.response.start' and not recorded:
+                record(message['status'],
+                       _content_length(message.get('headers', ())))
+            await send(message)
+
+        status_code = 0
         try:
-            response = await call_next(request)
-            status_code = response.status_code
+            await self.app(scope, receive, send_and_record)
+            # Returned without starting a response; the server answers 500.
+            status_code = 500
         except Exception:  # pylint: disable=broad-except
             # Escaped every inner layer; Starlette's error handler (outside
             # us) turns it into a bare 500. Count what the client sees.
             status_code = 500
             raise
         finally:
-            # This layer is outermost, so it sees 100% of responses: a
-            # recording fault must not turn a served request into a 500.
-            middleware_utils.record_safely('request', self._record, request,
-                                           method, status_code, start_time)
-
-        return response
+            if not recorded:
+                record(status_code, None)
+            caller_usage.end_http_call(http_call_token)
 
     def _path_label(self, request: fastapi.Request, raw_path: str) -> str:
         """`path` label, never raising: a fault must not lose the count.
@@ -2444,6 +2485,62 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         if request_name is not None:
             metrics_utils.SKY_APISERVER_REQUEST_GET_DURATION_SECONDS.labels(
                 name=request_name, status=status_code_group).observe(duration)
+
+
+# Route handlers left out of caller usage: /api/get is counted by the request
+# it returns; health probes and dashboard pages are not API usage.
+_CALLER_USAGE_SKIPPED_PATHS = frozenset(
+    {'/api/get', '/api/health', '/dashboard'})
+_CALLER_USAGE_SKIPPED_PREFIXES = ('/dashboard/',)
+
+
+def _content_length(headers) -> Optional[int]:
+    for key, value in headers:
+        if key.lower() == b'content-length':
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _record_caller_usage(request: fastapi.Request,
+                         http_call: caller_usage.HttpCall, start_time: float,
+                         body_bytes: Optional[int]) -> None:
+    caller = caller_usage.caller_of_user(
+        getattr(request.state, 'impersonator', None) or
+        getattr(request.state, 'auth_user', None))
+    headers = request.headers
+    caller_usage.record_client(caller, headers.get('X-SkyPilot-Client-Type'),
+                               headers.get('User-Agent'),
+                               headers.get(server_constants.API_VERSION_HEADER))
+    # Set by /api/get and by a synchronous call that returned a request's
+    # result: the body is that request's result.
+    request_name = getattr(request.state, 'request_name', None)
+    if request_name is not None:
+        caller_usage.record_returned_bytes(caller, request_name, body_bytes)
+        return
+    if http_call.scheduled_request or not _reached_router(request):
+        return
+    raw_path = request.scope.get('path', '')
+    if (raw_path in _CALLER_USAGE_SKIPPED_PATHS or
+            raw_path.startswith(_CALLER_USAGE_SKIPPED_PREFIXES) or
+            _is_streaming_api(raw_path)):
+        return
+    route = request.scope.get('route')
+    if not isinstance(route, fastapi.routing.APIRoute):
+        return
+    path_params = request.scope.get('path_params') or {}
+    spanning = [
+        str(path_params.get(param, ''))
+        for param, convertor in route.param_convertors.items()
+        if isinstance(convertor, starlette.convertors.PathConvertor)
+    ]
+    name = (f'{request.method} ' +
+            caller_usage.route_template(raw_path, route.path_format, spanning))
+    caller_usage.record_execution(caller, name, caller_usage.KIND_HANDLER,
+                                  time.time() - start_time)
+    caller_usage.record_returned_bytes(caller, name, body_bytes)
 
 
 peak_rss_bytes = 0

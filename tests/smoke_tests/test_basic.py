@@ -19,6 +19,7 @@
 # Change cloud for generic tests to aws
 # > pytest tests/smoke_tests/test_basic.py --generic-cloud aws
 
+import copy
 import fcntl
 import json
 import os
@@ -1508,6 +1509,94 @@ def test_cluster_labels_in_status(generic_cloud: str):
         smoke_tests_utils.run_one_test(test)
 
 
+def test_cluster_job_spec(generic_cloud: str):
+    """Each cluster job's task YAML and entrypoint are recorded and returned.
+
+    Covers a YAML `sky launch` (job 1), a YAML `sky exec` with `--env`,
+    `--name` and `--num-nodes` overrides (job 2) and an inline `sky exec`
+    command (job 3), that the recorded YAML carries the overrides and has
+    secrets redacted, and that the specs are dropped with the cluster on
+    `sky down`. The file asks for 2 nodes and both submissions override it to
+    1, so the cluster stays a single node.
+    """
+    from sky.client import sdk
+
+    name = smoke_tests_utils.get_cluster_name()
+    marker = f'spec-marker-{name}'
+    override_marker = f'override-{name}'
+    inline_marker = f'inline-{name}'
+    renamed = f'renamed-{name}'
+    secret_value = f'secret-{name}'
+
+    def get_spec(job_id: int):
+        return sdk.stream_and_get(sdk.cluster_job_spec(name, job_id))
+
+    def check_specs():
+        expected = {
+            1: ('sky launch', marker),
+            2: ('sky exec', override_marker),
+            3: ('sky exec', inline_marker),
+        }
+        for job_id, (command, yaml_text) in expected.items():
+            spec = get_spec(job_id)
+            assert spec is not None, f'No spec recorded for job {job_id}'
+            assert spec['entrypoint'].startswith(command), spec
+            assert name in spec['entrypoint'], spec
+            assert yaml_text in spec['task_yaml'], spec
+            assert secret_value not in spec['task_yaml'], (
+                f'Secret leaked into the recorded YAML of job {job_id}: '
+                f'{spec["task_yaml"]}')
+        assert get_spec(4) is None, 'Spec returned for a job that never ran'
+
+        # `--num-nodes 1` on a file asking for 2, and `--name` on job 2.
+        for job_id in (1, 2):
+            recorded = yaml_utils.safe_load(get_spec(job_id)['task_yaml'])
+            assert recorded['num_nodes'] == 1, (job_id, recorded)
+        assert yaml_utils.safe_load(get_spec(2)['task_yaml'])['name'] == renamed
+
+    def check_specs_dropped():
+        assert get_spec(1) is None, 'Spec outlived the terminated cluster'
+
+    yaml_content = textwrap.dedent(f"""\
+        name: spec-file-name
+
+        resources:
+          cpus: 2+
+
+        num_nodes: 2
+
+        envs:
+          SPEC_MARKER: {marker}
+
+        secrets:
+          SPEC_SECRET: {secret_value}
+
+        run: |
+          echo "$SPEC_MARKER"
+        """)
+
+    with tempfile.NamedTemporaryFile(suffix='.yaml', mode='w') as f:
+        f.write(yaml_content)
+        f.flush()
+        yaml_path = f.name
+
+        test = smoke_tests_utils.Test(
+            'cluster_job_spec',
+            [
+                f'sky launch -y -c {name} --infra {generic_cloud} {smoke_tests_utils.LOW_RESOURCE_ARG} --num-nodes 1 {yaml_path}',
+                f'sky exec {name} --env SPEC_MARKER={override_marker} --name {renamed} --num-nodes 1 {yaml_path}',
+                f'sky exec {name} "echo {inline_marker}"',
+                lambda: check_specs(),
+                f'sky down -y {name}',
+                lambda: check_specs_dropped(),
+            ],
+            teardown=f'sky down -y {name}',
+            env=smoke_tests_utils.LOW_CONTROLLER_RESOURCE_ENV,
+            timeout=15 * 60,
+        )
+        smoke_tests_utils.run_one_test(test)
+
+
 # The sky launch CLI has some additional checks to make sure the cluster is up/
 # restarted. However, the core API doesn't have these; make sure it still works
 @pytest.mark.no_kubernetes
@@ -1904,7 +1993,22 @@ def test_kubernetes_context_failover(unreachable_context):
                     sky.server.common.get_server_url()
             },
         )
-        smoke_tests_utils.run_one_test(test)
+        # A remote API server ignores allowed_contexts in a client's config,
+        # so set it on the server for the duration of the test.
+        original_server_config = None
+        if smoke_tests_utils.is_docker_remote_api_server():
+            original_server_config = smoke_tests_utils.get_api_server_config()
+            server_config = copy.deepcopy(original_server_config)
+            server_config.setdefault('kubernetes', {})['allowed_contexts'] = [
+                context, unreachable_context, '_nonexist_', 'kind-skypilot'
+            ]
+            smoke_tests_utils.update_api_server_config(server_config)
+        try:
+            smoke_tests_utils.run_one_test(test)
+        finally:
+            if original_server_config is not None:
+                smoke_tests_utils.update_api_server_config(
+                    original_server_config)
 
 
 @pytest.mark.kubernetes
@@ -2173,8 +2277,7 @@ def test_kubernetes_slurm_show_gpus(generic_cloud: str):
             # 2. The cluster has no GPUs, and the expected message is shown
             '(echo "$s" | grep -A 1 "REQUESTABLE_QTY_PER_NODE" | '
             'grep -E "^[A-Z0-9]+[[:space:]]+[0-9, ]+[[:space:]]+[0-9]+ of [0-9]+ free" || '
-            f'echo "$s" | grep "No GPUs found in any {generic_cloud.capitalize()} clusters")'
-        )
+            'echo "$s" | grep "No GPUs found in")')
 
     test = smoke_tests_utils.Test(
         'kubernetes_show_gpus',
@@ -2732,22 +2835,31 @@ def test_nebius_security_group_lifecycle():
             f'expected 8 rules after adding 20 batched ports, got '
             f'{len(nebius_utils.list_security_rules(sg_id))}')
 
-        # cleanup_ports must NOT delete the SG. SG ownership belongs to
-        # the VM lifecycle (terminate_instances), not the port lifecycle.
+        # With no instances left in the cluster, cleanup_ports is the
+        # post-teardown backstop that reaps the SkyPilot-managed SG (it only
+        # leaves the SG in place while instances exist). This test never
+        # launches a VM, so cleanup_ports must delete the SG here. This also
+        # exercises delete_security_group's rule-drain-then-delete path
+        # against the real Nebius "cannot delete with rules" precondition.
         nebius_instance.cleanup_ports(test_cluster, ['8080'],
                                       provider_config={'region': region})
-        assert nebius_utils.get_security_group_by_name(
-            project_id, sg_name) == sg_id, (
-                'cleanup_ports must not delete the SG; deleting it on a '
-                'still-running cluster would break SSH and intra-cluster '
-                'Ray traffic.')
+        # SG deletion is async; poll until it disappears.
+        for _ in range(30):
+            if nebius_utils.get_security_group_by_name(project_id,
+                                                       sg_name) is None:
+                break
+            time.sleep(2)
+        else:
+            raise AssertionError(
+                f'cleanup_ports did not delete SG {sg_id} of a cluster '
+                'with no instances.')
 
     finally:
-        # delete_security_group exercises the rule-drain-then-delete path
-        # that the unit tests didn't cover (they mocked list_security_rules
-        # to return [] so the drain logic was never exercised against the
-        # real Nebius "cannot delete with rules" precondition).
-        if sg_id is not None:
+        # Best-effort cleanup if the test failed before cleanup_ports reaped
+        # the SG. Skip if it is already gone: delete_security_group lists
+        # the SG's rules first, which fails on a deleted SG.
+        if (sg_id is not None and nebius_utils.get_security_group_by_name(
+                project_id, sg_name) is not None):
             print(f'Cleaning up SG {sg_id}')
             nebius_utils.delete_security_group(sg_id)
             time.sleep(2)

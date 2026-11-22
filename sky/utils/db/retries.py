@@ -7,11 +7,12 @@ that mark jobs as FAILED_CONTROLLER, or — for longer outages — leave the
 catch-all's own DB write failing too, producing a silent RUNNING zombie.
 
 Wrap any DB-touching call site with one of these helpers. They catch
-`sqlalchemy.exc.OperationalError` (which wraps `psycopg2.OperationalError`
+`sqlalchemy_exc.OperationalError` (which wraps `psycopg2.OperationalError`
 and many asyncpg connection errors), plus raw driver/network exceptions
 that can escape SQLAlchemy, also when a driver error is the `__cause__` of
 the raised exception, and retry with exponential backoff + jitter.
 """
+from __future__ import annotations
 
 import asyncio
 import functools
@@ -21,20 +22,31 @@ import sys
 import time
 from typing import Awaitable, Callable, Optional, Set, Tuple, Type, TypeVar
 
-import sqlalchemy.exc
-
+from sky.adaptors import common as adaptors_common
 from sky.utils import common_utils
+from sky.utils.db import sqlalchemy_deps
+
+sqlalchemy_exc = adaptors_common.LazyImport(
+    'sqlalchemy.exc',
+    import_error_message=sqlalchemy_deps.SQLALCHEMY_INSTALL_MSG)
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
+
+_DRIVER_EXCEPTIONS: Optional[Tuple[Type[BaseException], ...]] = None
 
 
 def _build_driver_exceptions() -> Tuple[Type[BaseException], ...]:
     # `psycopg2.OperationalError` is the raw driver error; SQLAlchemy
     # wraps it for normal session.execute() paths, but anything that
     # uses `engine.raw_connection()` (notably `PostgresLock`) raises
-    # the unwrapped class. Import lazily so sqlite-only installs work.
+    # the unwrapped class. Import lazily so client installs without
+    # SQLAlchemy / psycopg2 still import this module.
+    global _DRIVER_EXCEPTIONS
+    if _DRIVER_EXCEPTIONS is not None:
+        return _DRIVER_EXCEPTIONS
+    sqlalchemy_deps.require_sqlalchemy()
     psycopg2_excs: Tuple[Type[BaseException], ...] = ()
     try:
         import psycopg2  # pylint: disable=import-outside-toplevel
@@ -44,32 +56,50 @@ def _build_driver_exceptions() -> Tuple[Type[BaseException], ...]:
         psycopg2_excs = (psycopg2.OperationalError, psycopg2.InterfaceError)
     except ImportError:
         pass
-    return (
-        sqlalchemy.exc.OperationalError,
-        sqlalchemy.exc.InterfaceError,
+    _DRIVER_EXCEPTIONS = (
+        sqlalchemy_exc.OperationalError,
+        sqlalchemy_exc.InterfaceError,
         *psycopg2_excs,
     )
-
-
-_DRIVER_EXCEPTIONS = _build_driver_exceptions()
+    return _DRIVER_EXCEPTIONS
 
 
 def _asyncpg_exceptions() -> Tuple[Type[BaseException], ...]:
-    # asyncpg.connect() runs inside the engine's async_creator, so an
-    # ErrorResponse received while connecting is raised as asyncpg's own
-    # class, not wrapped by SQLAlchemy: class 08 connection errors (which a
-    # pooler such as PgBouncer uses for every rejection it issues, 08P01),
-    # 57P03 (server starting up / shutting down) and 53300 (too many
-    # connections). Resolved from sys.modules rather than imported: the
-    # import costs ~40ms per process, and an asyncpg error can only be in
-    # flight in a process that has already imported asyncpg.
+    # At connect, SQLAlchemy 2.0 lets an asyncpg error escape unwrapped and
+    # 2.1 wraps it in DBAPIError; mid-statement, both wrap it. is_transient
+    # checks the exception and its cause chain, so either form is caught.
+    # Transient here:
+    # - class 08 connection errors (a pooler such as PgBouncer uses 08P01
+    #   for every rejection it issues) and 57P03 (server starting up or
+    #   shutting down);
+    # - 57P01 (admin shutdown), 57P02 (crash shutdown) and class 53
+    #   insufficient resources (53100 disk full, 53200 out of memory, 53300
+    #   too many connections, 53400 configuration limit). psycopg2 raises
+    #   all of these as OperationalError, which counts as transient. Some
+    #   53xxx causes never heal for a given statement (temp_file_limit, a
+    #   transaction that takes more locks than the lock table holds); they
+    #   cost the retry budget, as they already do on the psycopg2 path;
+    # - 25P03 (idle-in-transaction timeout) and 25006 (a write sent to a
+    #   read-only server, e.g. a writer demoted by a failover while DNS
+    #   still points at it). psycopg2 raises these as InternalError, so
+    #   only the asyncpg path retries them.
+    # 57014 (query canceled) and 57P04 (database dropped) stay out on
+    # purpose, although psycopg2 retries both: a statement that always times
+    # out, or a dropped database, does not heal.
+    # Resolved from sys.modules rather than imported: the import costs
+    # ~40ms per process, and an asyncpg error can only be in flight in a
+    # process that has already imported asyncpg.
     asyncpg = sys.modules.get('asyncpg')
     if asyncpg is None:
         return ()
     return (
         asyncpg.exceptions.PostgresConnectionError,
         asyncpg.exceptions.CannotConnectNowError,
-        asyncpg.exceptions.TooManyConnectionsError,
+        asyncpg.exceptions.AdminShutdownError,
+        asyncpg.exceptions.CrashShutdownError,
+        asyncpg.exceptions.InsufficientResourcesError,
+        asyncpg.exceptions.IdleInTransactionSessionTimeoutError,
+        asyncpg.exceptions.ReadOnlySQLTransactionError,
     )
 
 
@@ -92,17 +122,33 @@ _NETWORK_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
     asyncio.TimeoutError,
 )
 
-RETRYABLE_EXCEPTIONS = _DRIVER_EXCEPTIONS + _NETWORK_EXCEPTIONS
+
+def _pool_exceptions() -> Tuple[Type[BaseException], ...]:
+    sqlalchemy_deps.require_sqlalchemy()
+    return (sqlalchemy_exc.TimeoutError,)
 
 
-def is_transient(error: BaseException) -> bool:
+def retryable_exceptions() -> Tuple[Type[BaseException], ...]:
+    """Driver + network exceptions that warrant a retry (lazy SQLAlchemy)."""
+    return _build_driver_exceptions() + _NETWORK_EXCEPTIONS
+
+
+# RETRYABLE_EXCEPTIONS is exposed via module __getattr__ (lazy SQLAlchemy).
+
+
+def _is_transient(error: BaseException, include_pool_timeout: bool) -> bool:
     """Whether `error` is a transient DB error, directly or by `__cause__`.
 
     Along the cause chain only driver errors count: the bare network
-    builtins are retryable only when raised at the top level.
+    builtins are retryable only when raised at the top level. A pool checkout
+    timeout is transient for controller bookkeeping but excluded from bounded
+    operation retries, where it must fail fast.
     """
-    driver_excs = _DRIVER_EXCEPTIONS + _asyncpg_exceptions()
-    if isinstance(error, driver_excs + _NETWORK_EXCEPTIONS):
+    driver_excs = _build_driver_exceptions() + _asyncpg_exceptions()
+    exceptions = driver_excs + _NETWORK_EXCEPTIONS
+    if include_pool_timeout:
+        exceptions += _pool_exceptions()
+    if isinstance(error, exceptions):
         return True
     seen: Set[int] = set()
     current = error.__cause__
@@ -112,6 +158,11 @@ def is_transient(error: BaseException) -> bool:
         seen.add(id(current))
         current = current.__cause__
     return False
+
+
+def is_transient(error: BaseException) -> bool:
+    """Whether ``error`` is a transient database error."""
+    return _is_transient(error, include_pool_timeout=True)
 
 
 # 5 attempts × exp backoff capped at 5s ≈ ~10s of backoff sleeps — covers
@@ -129,7 +180,8 @@ _DEFAULT_MAX_BACKOFF = 5.0
 
 def summarize(e: BaseException) -> str:
     """One-line exception summary (SQLAlchemy errors are multi-line)."""
-    return f'{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ""}'
+    first_line = str(e).splitlines()[0] if str(e) else ''
+    return f'{type(e).__name__}: {first_line}'
 
 
 def _new_backoff(initial_backoff: float,
@@ -190,6 +242,7 @@ def with_db_retries(fn: Callable[[int], T],
     `deadline`, whichever comes first; pass `max_retries=None` to bound the
     loop by the deadline alone. Backoff sleeps never run past the deadline,
     so the last attempt starts no later than the deadline.
+
     """
     _check_bounds(max_retries, deadline, initial_backoff, max_backoff)
     backoff = _new_backoff(initial_backoff, max_backoff)
@@ -202,7 +255,7 @@ def with_db_retries(fn: Callable[[int], T],
                     f'Transient DB error recovered after {attempt} retries.')
             return result
         except Exception as e:  # pylint: disable=broad-except
-            if not is_transient(e):
+            if not _is_transient(e, include_pool_timeout=False):
                 raise
             attempt += 1
             if _budget_spent(attempt, max_retries, deadline):
@@ -233,7 +286,7 @@ async def with_db_retries_async(
                     f'Transient DB error recovered after {attempt} retries.')
             return result
         except Exception as e:  # pylint: disable=broad-except
-            if not is_transient(e):
+            if not _is_transient(e, include_pool_timeout=False):
                 raise
             attempt += 1
             if _budget_spent(attempt, max_retries, deadline):
@@ -274,3 +327,9 @@ def retry_async(coro_fn):
             lambda _attempt: coro_fn(*args, **kwargs))
 
     return wrapper
+
+
+def __getattr__(name: str):  # pylint: disable=invalid-name
+    if name == 'RETRYABLE_EXCEPTIONS':
+        return retryable_exceptions()
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

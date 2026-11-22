@@ -1,15 +1,10 @@
 """Unit tests for sky.jobs.utils functions."""
-import asyncio
-import contextlib
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 from unittest.mock import MagicMock
 
-import filelock
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky import exceptions
 from sky.jobs import constants as managed_job_constants
@@ -230,6 +225,7 @@ class TestGetManagedJobQueue:
             'job_duration': 0,
             'end_at': None,
             'failure_reason': None,
+            'created_at': None,
         }
         defaults.update(kwargs)
         return defaults
@@ -258,7 +254,9 @@ class TestGetManagedJobQueue:
             # Return all jobs for simplicity, filtering would be tested separately
             return jobs, len(jobs)
 
-        def fake_get_managed_jobs_highest_priority():
+        def fake_get_managed_jobs_highest_priority(
+                max_launching_jobs_per_user=None):
+            del max_launching_jobs_per_user
             if not jobs:
                 return 0
             return max(job.get('priority', 0) for job in jobs)
@@ -972,7 +970,10 @@ class TestStreamLogsByIdTaskFiltering:
         # Task filter is int 1, should match task_id=1 (eval)
         # We need to verify the filter finds the right task by checking
         # that it doesn't return NOT_FOUND
-        # Mock get_status to return a terminal status so we exit early
+        # Mock the task's status to a terminal one so we exit early
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_job_status_with_task_id',
+            lambda jid, tid: managed_job_state.ManagedJobStatus.SUCCEEDED)
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
             lambda jid: managed_job_state.ManagedJobStatus.SUCCEEDED)
@@ -1000,6 +1001,9 @@ class TestStreamLogsByIdTaskFiltering:
             'get_all_task_ids_names_statuses_logs',
             lambda jid: task_info,
         )
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_job_status_with_task_id',
+            lambda jid, tid: managed_job_state.ManagedJobStatus.SUCCEEDED)
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
             lambda jid: managed_job_state.ManagedJobStatus.SUCCEEDED)
@@ -1154,6 +1158,200 @@ class TestStreamLogsByIdTaskFiltering:
         assert exit_code == exceptions.JobExitCode.NOT_FOUND
         # Single task should show '0' not '0-0'
         assert 'Valid task IDs are 0.' in msg or 'Valid task IDs are 0,' in msg
+
+
+class TestStreamLogsByIdFinishedTaskInRunningJob:
+    """A task that finished while another task keeps the job running.
+
+    This is a job group task, or a pipeline task followed by the next one.
+    Its logs come from the copy the controller saved, not from its cluster,
+    which may be gone by then: a pipeline tears it down, and a job group keeps
+    its record until the group ends while its idle autodown deletes it.
+    """
+
+    def _patch_group(self, monkeypatch, trainer_statuses, log_files=(None,)):
+        """Stubs job 7: task 0 (trainer) takes trainer_statuses in turn, and
+        successive reads of its log path return log_files in turn (the last
+        of each repeats). Task 1 (inference) keeps the job RUNNING."""
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        statuses = iter(trainer_statuses)
+        trainer_status = [trainer_statuses[-1]]
+        paths = iter(log_files)
+        trainer_log = [log_files[-1]]
+
+        def _task_status(job_id, task_id):
+            assert job_id == 7, job_id
+            if task_id == 1:
+                return running
+            trainer_status[0] = next(statuses, trainer_status[0])
+            return trainer_status[0]
+
+        def _task_info(job_id):
+            assert job_id == 7, job_id
+            trainer_log[0] = next(paths, trainer_log[0])
+            return [(0, 'trainer', trainer_status[0], trainer_log[0], None),
+                    (1, 'inference', running, None, None)]
+
+        mock_state = MagicMock(wraps=managed_job_state)
+        mock_state.ManagedJobStatus = managed_job_state.ManagedJobStatus
+        mock_state.ManagedJobScheduleState = (
+            managed_job_state.ManagedJobScheduleState)
+        mock_state.get_num_tasks.return_value = 2
+        mock_state.get_status.return_value = running
+        mock_state.get_latest_task_id_status.return_value = (1, running)
+        mock_state.get_job_status_with_task_id.side_effect = _task_status
+        mock_state.get_all_task_ids_names_statuses_logs.side_effect = _task_info
+        mock_state.get_submitted_task_ids.return_value = {0, 1}
+        mock_state.get_job_schedule_state.return_value = (
+            managed_job_state.ManagedJobScheduleState.ALIVE)
+        mock_state.is_batch_job.return_value = False
+        mock_state.get_pool_from_job_id.return_value = None
+        mock_state.get_task_name.return_value = 'trainer'
+        monkeypatch.setattr(jobs_utils, 'managed_job_state', mock_state)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, '_runtimes', [])
+        monkeypatch.setattr(jobs_utils.log_lib, 'start_orphan_watchdog',
+                            lambda: None)
+        mock_logs = MagicMock()
+        mock_logs.get_log_reader.return_value = None
+        monkeypatch.setattr(jobs_utils, 'logs', mock_logs)
+        sleeps = []
+
+        def _sleep(seconds):
+            # Before the fix the tail retried the cluster for as long as the
+            # job ran; fail instead of hanging.
+            sleeps.append(seconds)
+            if len(sleeps) > 3:
+                raise AssertionError(f'tail did not stop; slept {sleeps}')
+
+        monkeypatch.setattr(jobs_utils.time, 'sleep', _sleep)
+
+    @pytest.mark.parametrize('follow', [False, True])
+    def test_prints_saved_log_without_the_cluster(self, monkeypatch, tmp_path,
+                                                  capsys, follow):
+        log_file = tmp_path / 'trainer.log'
+        log_file.write_text(
+            f'{jobs_utils.log_lib.LOG_FILE_START_STREAMING_AT}\n'
+            'trainer output\n',
+            encoding='utf-8')
+        self._patch_group(monkeypatch,
+                          [managed_job_state.ManagedJobStatus.SUCCEEDED],
+                          log_files=[str(log_file)])
+        monkeypatch.setattr(
+            jobs_utils.global_user_state, 'get_handle_from_cluster_name',
+            MagicMock(side_effect=AssertionError('must not tail the cluster')))
+
+        _, code = jobs_utils.stream_logs_by_id(7, follow=follow, task=0)
+
+        out = capsys.readouterr().out
+        assert 'trainer output' in out
+        assert 'Task trainer(0) finished (status: SUCCEEDED)' in out
+        # The job is still running.
+        assert 'Job finished' not in out
+        assert code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_waits_for_the_saved_log_of_a_just_finished_task(
+            self, monkeypatch, tmp_path, capsys):
+        # The controller marks the task SUCCEEDED before it records the path
+        # of the log it saves, so the first reads find none.
+        log_file = tmp_path / 'trainer.log'
+        log_file.write_text(
+            f'{jobs_utils.log_lib.LOG_FILE_START_STREAMING_AT}\n'
+            'trainer output\n',
+            encoding='utf-8')
+        self._patch_group(monkeypatch,
+                          [managed_job_state.ManagedJobStatus.SUCCEEDED],
+                          log_files=[None, None, str(log_file)])
+
+        _, code = jobs_utils.stream_logs_by_id(7, follow=False, task=0)
+
+        assert 'trainer output' in capsys.readouterr().out
+        assert code == exceptions.JobExitCode.SUCCEEDED
+
+    @pytest.mark.parametrize('task_filter', [0, 'completed'])
+    @pytest.mark.parametrize('follow', [False, True])
+    @pytest.mark.parametrize('storage', ['local', 'external', 'missing'])
+    @pytest.mark.parametrize('task_status',
+                             ['SUCCEEDED', 'FAILED', 'CANCELLED'])
+    def test_log_sources(self, monkeypatch, tmp_path, capsys, task_filter,
+                         follow, storage, task_status):
+        status = managed_job_state.ManagedJobStatus
+        log_file = tmp_path / 'completed.log'
+        log_file.write_text(jobs_utils.log_lib.LOG_FILE_START_STREAMING_AT +
+                            '\nCOMPLETED_TASK_MARKER\n')
+        task_info = [
+            (0, 'completed', status[task_status],
+             str(log_file) if storage == 'local' else None, None),
+            (1, 'running', status.RUNNING, None, None),
+        ]
+        state = MagicMock(wraps=managed_job_state)
+        state.ManagedJobStatus = status
+        state.ManagedJobScheduleState = (
+            managed_job_state.ManagedJobScheduleState)
+        state.get_num_tasks.return_value = 2
+        state.get_status.return_value = status.RUNNING
+        state.get_job_status_with_task_id.side_effect = (
+            lambda jid, tid: task_info[tid][2])
+        state.get_all_task_ids_names_statuses_logs.return_value = task_info
+        state.get_submitted_task_ids.return_value = {0, 1}
+        state.get_job_schedule_state.return_value = (
+            managed_job_state.ManagedJobScheduleState.ALIVE)
+        state.get_pool_from_job_id.return_value = None
+        state.is_batch_job.return_value = False
+        state.get_latest_task_id_status.side_effect = AssertionError(
+            'Completed task must replay saved logs without live polling')
+        monkeypatch.setattr(jobs_utils, 'managed_job_state', state)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, '_runtimes', [])
+        monkeypatch.setattr(jobs_utils.log_lib, 'start_orphan_watchdog',
+                            lambda: None)
+        reader = MagicMock() if storage == 'external' else None
+        if reader is not None:
+            reader.read_cluster_job_logs.return_value = 0
+        monkeypatch.setattr(jobs_utils.logs, 'get_log_reader', lambda: reader)
+        # A SUCCEEDED task whose log was never saved waits out the deadline.
+        clock = iter(range(0, 1000, 5))
+        monkeypatch.setattr(jobs_utils.time, 'time', lambda: next(clock))
+        monkeypatch.setattr(jobs_utils.time, 'sleep', lambda _: None)
+
+        msg, code = jobs_utils.stream_logs_by_id(5,
+                                                 follow=follow,
+                                                 tail=10,
+                                                 task=task_filter)
+
+        output = capsys.readouterr().out
+        assert code == exceptions.JobExitCode.from_managed_job_status(
+            status[task_status])
+        assert 'Job finished' not in output
+        if storage == 'local':
+            assert 'COMPLETED_TASK_MARKER' in output
+        elif storage == 'external':
+            reader.read_cluster_job_logs.assert_called_once_with(
+                jobs_utils.generate_managed_job_cluster_name('completed', 5),
+                None,
+                follow=False,
+                tail=10)
+        else:
+            assert 'Task completed(0) of job 5' in msg
+            assert task_status in msg
+
+    def test_live_tail_stops_once_the_task_finishes(self, monkeypatch):
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        # RUNNING when the tail starts, SUCCEEDED once the tail fails.
+        self._patch_group(
+            monkeypatch,
+            [running, running, managed_job_state.ManagedJobStatus.SUCCEEDED])
+        monkeypatch.setattr(
+            jobs_utils.global_user_state, 'get_handle_from_cluster_name', lambda
+            _: MagicMock(spec=jobs_utils.backends.CloudVmRayResourceHandle))
+        backend = MagicMock()
+        # The cluster is gone, so the tail fails without a job exit code.
+        backend.tail_logs.return_value = 255
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            lambda: backend)
+
+        _, code = jobs_utils.stream_logs_by_id(7, follow=False, task=0)
+
+        backend.tail_logs.assert_called_once()
+        assert code == exceptions.JobExitCode.SUCCEEDED
 
 
 class TestFormatJobDetails:
@@ -1658,6 +1856,297 @@ class TestStreamLogsByIdExternalStoreFallback:
         # Should not raise.
         msg, _ = jobs_utils.stream_logs_by_id(5, follow=False, tail=None)
         assert 'external log store' in msg
+
+
+class TestStreamLogsByIdJobFinishedBetweenChecks:
+    """A followed tail prints a job's logs even if it never saw it RUNNING.
+
+    A short job is RUNNING only until the controller's next status check, which
+    can come before the tail's next one. The tail then goes from STARTING
+    straight to a terminal status without streaming from the cluster, and must
+    print the logs the controller persists for the finished job instead.
+    """
+
+    def _patch_job(
+            self,
+            monkeypatch,
+            final_status,
+            log_files,
+            submitted=True,
+            batch=False,
+            schedule_state=managed_job_state.ManagedJobScheduleState.ALIVE,
+            reader=None):
+        """Stubs a job that is STARTING on entry and final_status afterwards.
+
+        log_files: what successive reads of the task's local log path return;
+            the last one repeats.
+        submitted: whether the task began launching (False for a task with
+            no run command).
+        batch: whether the job is a batch coordinator job.
+        schedule_state: the job's schedule state while the tail waits.
+        reader: the registered log reader, if any.
+        """
+        starting = managed_job_state.ManagedJobStatus.STARTING
+        statuses = iter([starting])
+        mock_state = MagicMock(wraps=managed_job_state)
+        mock_state.ManagedJobStatus = managed_job_state.ManagedJobStatus
+        mock_state.ManagedJobScheduleState = (
+            managed_job_state.ManagedJobScheduleState)
+        mock_state.get_job_schedule_state.return_value = schedule_state
+        mock_state.get_num_tasks.return_value = 1
+        mock_state.get_status.side_effect = (
+            lambda _: next(statuses, final_status))
+        mock_state.is_batch_job.return_value = batch
+        mock_state.get_submitted_task_ids.return_value = ({0} if submitted else
+                                                          set())
+        mock_state.get_latest_task_id_status.side_effect = [(0, starting),
+                                                            (0, final_status)]
+        mock_state.get_pool_from_job_id.return_value = None
+        mock_state.get_task_name.return_value = 'mytask'
+        reads = iter(log_files)
+        last = [log_files[-1]]
+
+        def _task_info(_):
+            last[0] = next(reads, last[0])
+            return [(0, 'mytask', final_status, last[0], None)]
+
+        mock_state.get_all_task_ids_names_statuses_logs.side_effect = _task_info
+        monkeypatch.setattr(jobs_utils, 'managed_job_state', mock_state)
+        # The cluster is never seen while the job is RUNNING.
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', lambda _: None)
+        monkeypatch.setattr(jobs_utils, 'read_provision_status_from_log',
+                            lambda path, pos, msg: (pos, msg))
+        monkeypatch.setattr(jobs_utils, '_parked_launch_reason',
+                            lambda *args: None)
+        monkeypatch.setattr(jobs_utils.time, 'sleep', lambda _: None)
+        mock_logs = MagicMock()
+        mock_logs.get_log_reader.return_value = reader
+        monkeypatch.setattr(jobs_utils, 'logs', mock_logs)
+        return mock_state
+
+    def test_prints_persisted_logs(self, monkeypatch, tmp_path, capsys):
+        log_file = tmp_path / 'run.log'
+        log_file.write_text(
+            f'{jobs_utils.log_lib.LOG_FILE_START_STREAMING_AT}\njob output\n',
+            encoding='utf-8')
+        # The controller records the log path only after it marks the job
+        # SUCCEEDED, so the first reads find none.
+        self._patch_job(monkeypatch,
+                        managed_job_state.ManagedJobStatus.SUCCEEDED,
+                        [None, None, str(log_file)])
+
+        _, code = jobs_utils.stream_logs_by_id(5, follow=True)
+
+        assert 'job output' in capsys.readouterr().out
+        assert code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_waits_for_a_local_copy_with_a_reader_registered(
+            self, monkeypatch, tmp_path, capsys):
+        # A registered reader does not mean the controller keeps no copy: in
+        # a placement without a logging agent it keeps one, and the tail must
+        # wait for it rather than ask a store that never got the logs.
+        log_file = tmp_path / 'run.log'
+        log_file.write_text(
+            f'{jobs_utils.log_lib.LOG_FILE_START_STREAMING_AT}\njob output\n',
+            encoding='utf-8')
+        self._patch_job(monkeypatch,
+                        managed_job_state.ManagedJobStatus.SUCCEEDED,
+                        [None, None, str(log_file)],
+                        reader=MagicMock())
+
+        jobs_utils.stream_logs_by_id(5, follow=True)
+
+        assert 'job output' in capsys.readouterr().out
+
+    def test_stops_waiting_once_the_job_is_done(self, monkeypatch):
+        # The controller kept no copy (the logs are in the store) and is done
+        # with the job: nothing more will be recorded, so stop waiting.
+        mock_state = self._patch_job(
+            monkeypatch,
+            managed_job_state.ManagedJobStatus.SUCCEEDED, [None],
+            schedule_state=managed_job_state.ManagedJobScheduleState.DONE)
+        clock = iter(range(0, 1000, 5))
+        monkeypatch.setattr(jobs_utils.time, 'time', lambda: next(clock))
+
+        jobs_utils.stream_logs_by_id(5, follow=True)
+
+        # One read in the wait, one in the terminal-job read.
+        assert mock_state.get_all_task_ids_names_statuses_logs.call_count == 2
+        mock_state.get_job_schedule_state.assert_called_once_with(5)
+
+    def test_no_persisted_logs_to_wait_for(self, monkeypatch, capsys):
+        # A job that failed before it ran user code has no logs to wait for.
+        mock_state = self._patch_job(
+            monkeypatch, managed_job_state.ManagedJobStatus.FAILED_NO_RESOURCE,
+            [None])
+
+        jobs_utils.stream_logs_by_id(5, follow=True)
+
+        mock_state.get_all_task_ids_names_statuses_logs.assert_not_called()
+        assert 'already in terminal state' not in capsys.readouterr().out
+
+    def test_task_without_run_command_does_not_wait(self, monkeypatch, capsys):
+        # A task with no run command is SUCCEEDED without launching a cluster,
+        # so it never gets a log path; waiting for one would only delay the
+        # launch's exit.
+        mock_state = self._patch_job(
+            monkeypatch,
+            managed_job_state.ManagedJobStatus.SUCCEEDED, [None],
+            submitted=False)
+
+        _, code = jobs_utils.stream_logs_by_id(5, follow=True)
+
+        mock_state.get_all_task_ids_names_statuses_logs.assert_not_called()
+        assert 'already in terminal state' not in capsys.readouterr().out
+        assert code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_batch_job_does_not_wait(self, monkeypatch, capsys):
+        # A batch coordinator runs on the controller and keeps no task log.
+        mock_state = self._patch_job(
+            monkeypatch,
+            managed_job_state.ManagedJobStatus.SUCCEEDED, [None],
+            batch=True)
+
+        jobs_utils.stream_logs_by_id(5, follow=True)
+
+        mock_state.get_submitted_task_ids.assert_not_called()
+        mock_state.get_all_task_ids_names_statuses_logs.assert_not_called()
+        assert 'already in terminal state' not in capsys.readouterr().out
+
+    def test_failed_task_without_log_does_not_wait(self, monkeypatch, capsys):
+        # The controller records a failed task's log path, if any, before it
+        # marks the task failed, so there is nothing to wait for.
+        mock_state = self._patch_job(monkeypatch,
+                                     managed_job_state.ManagedJobStatus.FAILED,
+                                     [None])
+
+        _, code = jobs_utils.stream_logs_by_id(5, follow=True)
+
+        # One read in the wait, one in the terminal-job read.
+        assert mock_state.get_all_task_ids_names_statuses_logs.call_count == 2
+        assert 'already in terminal state' not in capsys.readouterr().out
+        assert code == exceptions.JobExitCode.FAILED
+
+    def test_log_never_persisted_prints_no_warning(self, monkeypatch, capsys):
+        # The log path never shows up (e.g. the download failed): the wait
+        # gives up and the tail ends as it did before, with no warning.
+        self._patch_job(monkeypatch,
+                        managed_job_state.ManagedJobStatus.SUCCEEDED, [None])
+        clock = iter(range(0, 1000, 5))
+        monkeypatch.setattr(jobs_utils.time, 'time', lambda: next(clock))
+
+        _, code = jobs_utils.stream_logs_by_id(5, follow=True)
+
+        assert 'already in terminal state' not in capsys.readouterr().out
+        assert code == exceptions.JobExitCode.SUCCEEDED
+
+
+class TestStreamLogsByIdStoreFollowAcrossTasks:
+    """A tail that follows each task from the log store moves on per task."""
+
+    def _patch_job(self, monkeypatch, num_tasks):
+        """Stubs a RUNNING job whose tasks finish one per store follow."""
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        latest = {'task_id': 0, 'status': running}
+        mock_state = MagicMock(wraps=managed_job_state)
+        mock_state.ManagedJobStatus = managed_job_state.ManagedJobStatus
+        mock_state.get_num_tasks.return_value = num_tasks
+        mock_state.get_status.side_effect = lambda _: latest['status']
+        mock_state.get_latest_task_id_status.side_effect = (
+            lambda _: (latest['task_id'], latest['status']))
+        mock_state.is_batch_job.return_value = False
+        mock_state.get_pool_from_job_id.return_value = None
+        mock_state.get_task_name.return_value = 'mytask'
+        monkeypatch.setattr(jobs_utils, 'managed_job_state', mock_state)
+        monkeypatch.setattr(
+            jobs_utils.global_user_state, 'get_handle_from_cluster_name', lambda
+            _: MagicMock(spec=jobs_utils.backends.CloudVmRayResourceHandle))
+        monkeypatch.setattr(jobs_utils, 'read_provision_status_from_log',
+                            lambda path, pos, msg: (pos, msg))
+        monkeypatch.setattr(jobs_utils.time, 'sleep', lambda _: None)
+        followed = []
+
+        def _follow(job_id, task_id, *args):
+            del job_id, args
+            followed.append(task_id)
+            # The task finishes and the controller moves on.
+            if task_id < num_tasks - 1:
+                latest['task_id'] = task_id + 1
+            else:
+                latest['status'] = succeeded
+            return 100.0
+
+        monkeypatch.setattr(jobs_utils, '_follow_from_log_store', _follow)
+        monkeypatch.setattr(jobs_utils, '_wait_for_task_recovery',
+                            lambda *args: False)
+        display = MagicMock()
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            lambda msg: display)
+        return display, followed
+
+    def test_shows_the_next_task_spinner(self, monkeypatch):
+        display, followed = self._patch_job(monkeypatch, num_tasks=2)
+
+        _, code = jobs_utils.stream_logs_by_id(5, follow=True)
+
+        assert followed == [0, 1]
+        assert code == exceptions.JobExitCode.SUCCEEDED
+        calls = [(c[0], c.args) for c in display.mock_calls]
+        waiting = ('update', (jobs_utils.ux_utils.spinner_message(
+            'Waiting for the next task: 1'),))
+        # The display was stopped for the store follow, so it is started
+        # again after the update rather than left hidden.
+        assert waiting in calls
+        assert ('start', ()) in calls[calls.index(waiting):]
+
+    def test_resume_point_is_used_once(self, monkeypatch):
+        # After a recovery the next follow resumes from when the task left
+        # RUNNING. When that follow falls back to the cluster, a later follow
+        # of the same task must not replay the attempt already streamed.
+        self._patch_job(monkeypatch, num_tasks=1)
+        mock_state = jobs_utils.managed_job_state
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        results = iter([100.0, None, 300.0])
+        recoveries = iter([True, False])
+        sinces = []
+
+        def _follow(job_id, task_id, task_name, handle, tail, since):
+            del job_id, task_id, task_name, handle, tail
+            sinces.append(since)
+            result = next(results)
+            if result == 300.0:
+                mock_state.get_status.side_effect = lambda _: succeeded
+                mock_state.get_latest_task_id_status.side_effect = (
+                    lambda _: (0, succeeded))
+            return result
+
+        monkeypatch.setattr(jobs_utils, '_follow_from_log_store', _follow)
+        monkeypatch.setattr(jobs_utils, '_wait_for_task_recovery',
+                            lambda *args: next(recoveries))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            lambda: False)
+        backend = MagicMock()
+        # Not a known exit code: the cluster tail ended without a result.
+        backend.tail_logs.return_value = 1
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            lambda: backend)
+
+        jobs_utils.stream_logs_by_id(5, follow=True)
+
+        assert sinces == [None, 100.0, None]
+
+    def test_last_task_shows_no_next_task_spinner(self, monkeypatch):
+        display, followed = self._patch_job(monkeypatch, num_tasks=1)
+
+        jobs_utils.stream_logs_by_id(5, follow=True)
+
+        assert followed == [0]
+        updates = [
+            c.args[0] for c in display.mock_calls if c[0] == 'update' and c.args
+        ]
+        assert not any('Waiting for the next task' in u for u in updates)
 
 
 class TestTryToGetJobEndTime:
@@ -2174,399 +2663,3 @@ class TestFormatJobTableDynamicMembers:
                                             show_user=False,
                                             return_rows=True)
         assert self._id_task_status(table) == [('70', '-', 'RUNNING')]
-
-
-def _claim_waiting_job(pid: int, pid_started_at: float) -> Optional[int]:
-    """Claim a job the way a controller does, via the production claim path.
-
-    get_waiting_job_async is the real WAITING -> LAUNCHING compare-and-swap
-    that stamps the claiming controller's pid; it is async, so run it to
-    completion on a throwaway event loop. Returns the claimed job id, or None
-    if nothing was claimable.
-    """
-
-    async def _claim():
-        return await managed_job_state.get_waiting_job_async(
-            pid=pid, pid_started_at=pid_started_at)
-
-    loop = asyncio.new_event_loop()
-    try:
-        claimed = loop.run_until_complete(_claim())
-    finally:
-        loop.close()
-    return None if claimed is None else claimed['job_id']
-
-
-@pytest.fixture
-def _mock_managed_jobs_db_conn(tmp_path, monkeypatch):
-    """Create a temporary SQLite DB for managed jobs state.
-
-    Same pattern as tests/unit_tests/test_sky/jobs/test_jobs_state.py.
-    """
-    db_path = tmp_path / 'managed_jobs_testing.db'
-    engine = create_engine(f'sqlite:///{db_path}')
-    async_engine = create_async_engine(f'sqlite+aiosqlite:///{db_path}',
-                                       connect_args={'timeout': 30})
-
-    @contextlib.contextmanager
-    def _tmp_db_lock(_section: str):
-        lock_path = tmp_path / f'.{_section}.lock'
-        with filelock.FileLock(str(lock_path), timeout=10):
-            yield
-
-    monkeypatch.setattr(managed_job_state.migration_utils, 'db_lock',
-                        _tmp_db_lock)
-    monkeypatch.setattr(managed_job_state._db_manager, '_engine', engine)
-    monkeypatch.setattr(managed_job_state._db_manager, '_engine_async',
-                        async_engine)
-    managed_job_state.create_table(engine)
-    yield engine
-
-
-class TestHaRecoveryForConsolidationMode:
-    """ha_recovery_for_consolidation_mode: one CAS-guarded reset per job."""
-
-    def _patch_common(self, monkeypatch, tmp_path, jobs=None):
-        """Stub the pieces of the recovery pass we're not exercising.
-
-        jobs, if given, replaces the state query with canned rows (following
-        TestGetManagedJobQueue's convention) instead of reading a real DB.
-        """
-        monkeypatch.setattr(jobs_utils.scheduler, 'maybe_start_controllers',
-                            lambda: None)
-        # Redirect the recovery log off of the real, possibly shared
-        # /tmp/jobs_ha_recovery.log path.
-        monkeypatch.setattr(jobs_utils.constants,
-                            'HA_PERSISTENT_RECOVERY_LOG_PATH',
-                            str(tmp_path / '{}ha_recovery.log'))
-        if jobs is not None:
-            monkeypatch.setattr(jobs_utils.managed_job_state,
-                                'get_managed_jobs_with_filters',
-                                lambda fields=None: (jobs, len(jobs)))
-
-    def _job_row(self, **overrides):
-        job = {
-            'job_id': 1,
-            'controller_pid': 100,
-            'controller_pid_started_at': 1.0,
-            'schedule_state': managed_job_state.ManagedJobScheduleState.ALIVE,
-            'status': managed_job_state.ManagedJobStatus.RUNNING,
-        }
-        job.update(overrides)
-        return job
-
-    def _patch_liveness(self, monkeypatch, alive):
-        """Make controller_process_alive return `alive`, or raise if it is an
-        exception instance."""
-
-        def _check(record, legacy_job_id):
-            del record, legacy_job_id  # Unused.
-            if isinstance(alive, BaseException):
-                raise alive
-            return alive
-
-        monkeypatch.setattr(jobs_utils, 'controller_process_alive', _check)
-
-    def _spy_reset(self, monkeypatch, return_value=None):
-        """Count reset_job_for_recovery calls, delegating to the real one
-        unless return_value is given."""
-        calls = []
-        real = managed_job_state.reset_job_for_recovery
-
-        def _reset(job_id, **kwargs):
-            calls.append((job_id, kwargs))
-            if return_value is not None:
-                return return_value
-            return real(job_id, **kwargs)
-
-        monkeypatch.setattr(jobs_utils.managed_job_state,
-                            'reset_job_for_recovery', _reset)
-        return calls
-
-    def _seed_multi_task_alive_job(self,
-                                   engine,
-                                   num_tasks: int,
-                                   *,
-                                   pid,
-                                   pid_started_at,
-                                   name: str = 'multi-task-job'):
-        """Seed one job with num_tasks tasks, owned by (pid, pid_started_at)
-        and in the ALIVE schedule state."""
-        job_id = managed_job_state.set_job_info_without_job_id(
-            name=name,
-            workspace='ws1',
-            entrypoint='ep',
-            pool=None,
-            pool_hash=None,
-            user_hash='user1')
-        for task_id in range(num_tasks):
-            managed_job_state.set_pending(job_id,
-                                          task_id=task_id,
-                                          task_name=f'task{task_id}',
-                                          resources_str='{}',
-                                          metadata='{}')
-        managed_job_state.scheduler_set_waiting([job_id], '/tmp/dag.yaml',
-                                                '/tmp/user.yaml', '/tmp/env',
-                                                None, 100)
-        with managed_job_state.orm.Session(engine) as session:
-            session.query(managed_job_state.job_info_table).filter(
-                managed_job_state.job_info_table.c.spot_job_id == job_id
-            ).update({
-                managed_job_state.job_info_table.c.controller_pid: pid,
-                managed_job_state.job_info_table.c.controller_pid_started_at: pid_started_at,
-                managed_job_state.job_info_table.c.schedule_state:
-                    managed_job_state.ManagedJobScheduleState.ALIVE.value,
-            })
-            session.commit()
-        return job_id
-
-    def _read_job_info(self, engine, job_id):
-        with managed_job_state.orm.Session(engine) as session:
-            return session.execute(
-                managed_job_state.sqlalchemy.select(
-                    managed_job_state.job_info_table.c.controller_pid,
-                    managed_job_state.job_info_table.c.
-                    controller_pid_started_at,
-                    managed_job_state.job_info_table.c.schedule_state,
-                ).where(managed_job_state.job_info_table.c.spot_job_id ==
-                        job_id)).fetchone()
-
-    def test_multi_task_job_is_reset_exactly_once(self, monkeypatch, tmp_path,
-                                                  _mock_managed_jobs_db_conn):
-        """The state query returns one row per task. A multi-task job whose
-        controller is dead must still be reset exactly once: each extra reset
-        can re-orphan the job right after a controller claims it, which is how
-        one recovery pass ends up with several controllers for one job."""
-        engine = _mock_managed_jobs_db_conn
-        job_id = self._seed_multi_task_alive_job(engine,
-                                                 4,
-                                                 pid=100,
-                                                 pid_started_at=1.0)
-        self._patch_common(monkeypatch, tmp_path)
-        self._patch_liveness(monkeypatch, alive=False)
-        calls = self._spy_reset(monkeypatch)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        assert calls == [(job_id, {
-            'expected_pid': 100,
-            'expected_pid_started_at': 1.0,
-            'expected_schedule_state':
-                managed_job_state.ManagedJobScheduleState.ALIVE,
-        })]
-        row = self._read_job_info(engine, job_id)
-        assert row.controller_pid is None
-        assert (row.schedule_state ==
-                managed_job_state.ManagedJobScheduleState.WAITING.value)
-
-    def test_concurrent_real_claim_survives_the_rest_of_the_pass(
-            self, monkeypatch, tmp_path, _mock_managed_jobs_db_conn):
-        """End-to-end interleaving of a recovery pass and real controller
-        claims, using the production claim path (get_waiting_job_async) rather
-        than hand-written row updates.
-
-        Three jobs are eligible for recovery, and a controller claims two of
-        them in the middle of the pass:
-
-        - job_a (4 tasks) is claimed right after the pass resets it. The
-          remaining 3 task rows must not reset it again (dedupe), so the fresh
-          claim keeps the job.
-        - job_b is recovered by someone else and then claimed before the pass
-          reaches its row, so the pass's own reset must lose the
-          compare-and-swap and leave the claim alone.
-        - job_c is untouched by the claims and must still be recovered, i.e.
-          neither of the above stops the pass.
-        """
-        engine = _mock_managed_jobs_db_conn
-        alive = managed_job_state.ManagedJobScheduleState.ALIVE
-        # get_managed_jobs_with_filters orders by spot_job_id descending, so
-        # seed in reverse: the last job seeded is the first one processed.
-        job_c = self._seed_multi_task_alive_job(engine,
-                                                1,
-                                                name='job-c',
-                                                pid=300,
-                                                pid_started_at=3.0)
-        job_b = self._seed_multi_task_alive_job(engine,
-                                                1,
-                                                name='job-b',
-                                                pid=200,
-                                                pid_started_at=2.0)
-        job_a = self._seed_multi_task_alive_job(engine,
-                                                4,
-                                                name='job-a',
-                                                pid=100,
-                                                pid_started_at=1.0)
-        self._patch_common(monkeypatch, tmp_path)
-        self._patch_liveness(monkeypatch, alive=False)
-
-        real_reset = managed_job_state.reset_job_for_recovery
-        calls = []
-        claimed = []
-
-        def _reset_and_let_controllers_claim(job_id, **kwargs):
-            calls.append(job_id)
-            applied = real_reset(job_id, **kwargs)
-            if job_id != job_a or not applied or claimed:
-                return applied
-            claimed.append(job_id)
-            # A controller polls for work and claims the job the pass just
-            # released -- the interleaving that used to be undone by the
-            # job's remaining task rows.
-            assert _claim_waiting_job(pid=999, pid_started_at=9.0) == job_a
-            # Meanwhile job_b is recovered by another actor and claimed too,
-            # before this pass reaches job_b's row.
-            assert real_reset(job_b,
-                              expected_pid=200,
-                              expected_pid_started_at=2.0,
-                              expected_schedule_state=alive) is True
-            assert _claim_waiting_job(pid=888, pid_started_at=8.0) == job_b
-            return applied
-
-        monkeypatch.setattr(jobs_utils.managed_job_state,
-                            'reset_job_for_recovery',
-                            _reset_and_let_controllers_claim)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        # Each job is visited once, in row order, despite job_a's 4 task rows.
-        assert calls == [job_a, job_b, job_c]
-
-        launching = managed_job_state.ManagedJobScheduleState.LAUNCHING.value
-        # job_a: the claim that landed mid-pass still owns the job.
-        row_a = self._read_job_info(engine, job_a)
-        assert row_a.controller_pid == 999
-        assert row_a.controller_pid_started_at == 9.0
-        assert row_a.schedule_state == launching
-        # job_b: the pass's reset lost the compare-and-swap to the claim.
-        row_b = self._read_job_info(engine, job_b)
-        assert row_b.controller_pid == 888
-        assert row_b.controller_pid_started_at == 8.0
-        assert row_b.schedule_state == launching
-        # job_c: recovered as usual.
-        row_c = self._read_job_info(engine, job_c)
-        assert row_c.controller_pid is None
-        assert (row_c.schedule_state ==
-                managed_job_state.ManagedJobScheduleState.WAITING.value)
-
-        log = (tmp_path / 'jobs_ha_recovery.log').read_text(encoding='utf-8')
-        assert log.count(f'Job {job_a} completed recovery') == 1
-        assert log.count(f'Job {job_c} completed recovery') == 1
-        assert f'Job {job_b} completed recovery' not in log
-        assert f'Skipping recovery of job {job_b}' in log
-
-    def test_dead_controller_reset_passes_observed_values(
-            self, monkeypatch, tmp_path):
-        self._patch_common(monkeypatch, tmp_path, [self._job_row()])
-        self._patch_liveness(monkeypatch, alive=False)
-        calls = self._spy_reset(monkeypatch, return_value=True)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        assert calls == [(1, {
-            'expected_pid': 100,
-            'expected_pid_started_at': 1.0,
-            'expected_schedule_state':
-                managed_job_state.ManagedJobScheduleState.ALIVE,
-        })]
-
-    def test_live_controller_is_not_reset(self, monkeypatch, tmp_path):
-        self._patch_common(monkeypatch, tmp_path, [self._job_row()])
-        self._patch_liveness(monkeypatch, alive=True)
-        calls = self._spy_reset(monkeypatch, return_value=True)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        assert not calls
-
-    def test_lost_cas_race_does_not_retry_and_continues(self, monkeypatch,
-                                                        tmp_path):
-        """A lost CAS is not retried, and does not stop the pass."""
-        self._patch_common(monkeypatch, tmp_path,
-                           [self._job_row(job_id=1),
-                            self._job_row(job_id=2)])
-        self._patch_liveness(monkeypatch, alive=False)
-        calls = self._spy_reset(monkeypatch, return_value=False)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        assert [job_id for job_id, _ in calls] == [1, 2]
-
-    def test_liveness_check_exception_falls_through_to_reset(
-            self, monkeypatch, tmp_path):
-        """A liveness check that raises is logged and then falls through to
-        the reset, and the pass continues to the next job.
-
-        Falling through is deliberate: the check can raise deterministically
-        for a pid that really is gone (e.g. the pid was recycled by another
-        user's process, so reading its cmdline raises every time), and this
-        pass only runs once per leadership acquisition -- skipping such a job
-        would leave it unrecovered until the next one. Distinguishing
-        indeterminate liveness from confirmed death needs a real verdict from
-        the liveness check, which is future work; until then the
-        compare-and-swap is what keeps a wrongly-reset live job from being
-        stolen, since a controller that is actually alive still owns the row.
-        """
-        raising_row = self._job_row(job_id=1)
-        ok_row = self._job_row(job_id=2)
-        self._patch_common(monkeypatch, tmp_path, [raising_row, ok_row])
-        calls = self._spy_reset(monkeypatch, return_value=True)
-
-        def _check(record, legacy_job_id):
-            del record  # Unused.
-            if legacy_job_id == 1:
-                raise RuntimeError('psutil blew up')
-            return False
-
-        monkeypatch.setattr(jobs_utils, 'controller_process_alive', _check)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        # Both jobs are reset, with the ownership values observed for each.
-        expected_kwargs = {
-            'expected_pid': 100,
-            'expected_pid_started_at': 1.0,
-            'expected_schedule_state':
-                managed_job_state.ManagedJobScheduleState.ALIVE,
-        }
-        assert calls == [(1, expected_kwargs), (2, expected_kwargs)]
-
-    def test_dedupe_checks_liveness_once_per_job(self, monkeypatch, tmp_path):
-        """The dedupe happens before the liveness check, so a multi-task job
-        costs one process check, not one per task."""
-        self._patch_common(
-            monkeypatch, tmp_path,
-            [self._job_row(), self._job_row(),
-             self._job_row()])
-        checked = []
-
-        def _check(record, legacy_job_id):
-            del record  # Unused.
-            checked.append(legacy_job_id)
-            return False
-
-        monkeypatch.setattr(jobs_utils, 'controller_process_alive', _check)
-        calls = self._spy_reset(monkeypatch, return_value=True)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        assert checked == [1]
-        assert len(calls) == 1
-
-    @pytest.mark.parametrize('schedule_state', [
-        managed_job_state.ManagedJobScheduleState.DONE,
-        managed_job_state.ManagedJobScheduleState.WAITING,
-        managed_job_state.ManagedJobScheduleState.INACTIVE,
-    ])
-    def test_not_eligible_schedule_states_are_not_reset(self, monkeypatch,
-                                                        tmp_path,
-                                                        schedule_state):
-        self._patch_common(monkeypatch, tmp_path, [
-            self._job_row(controller_pid=None,
-                          controller_pid_started_at=None,
-                          schedule_state=schedule_state)
-        ])
-        calls = self._spy_reset(monkeypatch, return_value=True)
-
-        jobs_utils.ha_recovery_for_consolidation_mode()
-
-        assert not calls

@@ -85,7 +85,7 @@ class BlobStorage(abc.ABC):
         """Acquire a GC coordination lock.
 
         Yields ``True`` if this caller should run GC, ``False`` otherwise.
-        Default: always yields ``True`` (single-replica mode).
+        Default: always yields ``True`` (single-server mode).
         """
         yield True
 
@@ -133,6 +133,16 @@ class BlobStorage(abc.ABC):
     def download_tmp_dir(self, user_hash: str) -> str:
         """Return a staging directory for log downloads for a user."""
         raise NotImplementedError
+
+    def request_results_dir(self) -> Optional[pathlib.Path]:
+        """Return the directory for request results kept outside the
+        requests table, or None to keep every result in the table.
+
+        Every API server instance that shares the requests table must resolve
+        this to the same directory, and it must persist as long as the requests
+        table does.
+        """
+        return None
 
     def local_disk_roots(self) -> Dict[str, str]:
         """Returns {name: path} for directories this backend writes locally.

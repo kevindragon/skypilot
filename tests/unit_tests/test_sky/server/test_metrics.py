@@ -601,6 +601,33 @@ def _response(status_code: int) -> MagicMock:
     return response
 
 
+async def _dispatch(middleware, request, call_next):
+    """Drive the middleware's ASGI entry with `call_next` as the next layer.
+
+    The next layer sends the status of whatever `call_next` returns, which is
+    also what this returns.
+    """
+    result = None
+
+    async def app(scope, receive, send):
+        del scope, receive
+        nonlocal result
+        result = await call_next(request)
+        await send({
+            'type': 'http.response.start',
+            'status': result.status_code,
+            'headers': [],
+        })
+        await send({'type': 'http.response.body', 'body': b''})
+
+    async def send(message):
+        del message
+
+    middleware.app = app
+    await middleware(request.scope, request.receive, send)
+    return result
+
+
 @pytest.fixture
 def prometheus_middleware():
     """Create PrometheusMiddleware instance for testing."""
@@ -623,7 +650,7 @@ async def test_middleware_successful_request(prometheus_middleware):
     call_next = AsyncMock(return_value=response)
 
     start_time = time.time()
-    result = await prometheus_middleware.dispatch(request, call_next)
+    result = await _dispatch(prometheus_middleware, request, call_next)
     end_time = time.time()
 
     assert result == response
@@ -663,7 +690,7 @@ async def test_middleware_streaming_request(prometheus_middleware):
     response = _response(200)
     call_next = AsyncMock(return_value=response)
 
-    result = await prometheus_middleware.dispatch(request, call_next)
+    result = await _dispatch(prometheus_middleware, request, call_next)
 
     assert result == response
 
@@ -692,7 +719,7 @@ async def test_middleware_exception_handling(prometheus_middleware):
     call_next = AsyncMock(side_effect=Exception("Test error"))
 
     with pytest.raises(Exception, match="Test error"):
-        await prometheus_middleware.dispatch(request, call_next)
+        await _dispatch(prometheus_middleware, request, call_next)
 
     # Check that 5xx metric was recorded even with exception
     total_requests = _get_metric_value('sky_apiserver_requests_total', {
@@ -716,7 +743,7 @@ async def test_middleware_different_status_codes(prometheus_middleware):
         request = _http_request(f'/test/{status_code}')
         call_next = AsyncMock(return_value=_response(status_code))
 
-        await prometheus_middleware.dispatch(request, call_next)
+        await _dispatch(prometheus_middleware, request, call_next)
 
         # Verify the correct status group was recorded
         total_requests = _get_metric_value(
@@ -754,6 +781,50 @@ def _app_with_routes() -> fastapi.FastAPI:
 
 
 @pytest.mark.asyncio
+async def test_duration_ends_when_the_response_starts(prometheus_middleware):
+    """Time spent streaming the body is not part of the duration."""
+    request = _http_request('/api/v1/status')
+
+    async def app(scope, receive, send):
+        del scope, receive
+        await send({
+            'type': 'http.response.start',
+            'status': 200,
+            'headers': []
+        })
+        await asyncio.sleep(0.5)
+        await send({'type': 'http.response.body', 'body': b''})
+
+    prometheus_middleware.app = app
+    await prometheus_middleware(request.scope, request.receive, AsyncMock())
+
+    labels = {'path': '/api/v1/status', 'method': 'GET', 'status': '2xx'}
+    assert _get_metric_value('sky_apiserver_request_duration_seconds_count',
+                             labels) == 1.0
+    assert _get_metric_value('sky_apiserver_request_duration_seconds_sum',
+                             labels) < 0.5
+
+
+@pytest.mark.asyncio
+async def test_an_app_returning_without_a_response_is_counted_as_500(
+        prometheus_middleware):
+    """The ASGI server answers such a request with a 500 itself."""
+    request = _http_request('/api/v1/status')
+
+    async def app(scope, receive, send):
+        del scope, receive, send
+
+    prometheus_middleware.app = app
+    await prometheus_middleware(request.scope, request.receive, AsyncMock())
+
+    assert _get_metric_value('sky_apiserver_requests_total', {
+        'path': '/api/v1/status',
+        'method': 'GET',
+        'status': '5xx'
+    }) == 1.0
+
+
+@pytest.mark.asyncio
 async def test_path_label_is_read_after_the_inner_layers_ran(
         prometheus_middleware):
     """Inner middlewares rewrite `scope['path']` in place (the internal
@@ -766,7 +837,7 @@ async def test_path_label_is_read_after_the_inner_layers_ran(
         req.scope['router'] = object()
         return _response(200)
 
-    await prometheus_middleware.dispatch(request, call_next)
+    await _dispatch(prometheus_middleware, request, call_next)
 
     assert _get_metric_value('sky_apiserver_requests_total', {
         'path': '/status',
@@ -779,8 +850,8 @@ async def test_path_label_is_read_after_the_inner_layers_ran(
 @pytest.mark.asyncio
 async def test_a_404_from_the_router_keeps_the_raw_path(prometheus_middleware):
     request = _http_request('/no/such/route')
-    await prometheus_middleware.dispatch(request,
-                                         AsyncMock(return_value=_response(404)))
+    await _dispatch(prometheus_middleware, request,
+                    AsyncMock(return_value=_response(404)))
     assert _get_metric_value('sky_apiserver_requests_total', {
         'path': '/no/such/route',
         'status': '4xx'
@@ -794,8 +865,8 @@ async def test_a_middleware_rejection_keeps_a_registered_route_path(
     series as the successes of `/status`."""
     app = _app_with_routes()
     request = _http_request('/status', reached_router=False, app=app)
-    await prometheus_middleware.dispatch(request,
-                                         AsyncMock(return_value=_response(503)))
+    await _dispatch(prometheus_middleware, request,
+                    AsyncMock(return_value=_response(503)))
     assert _get_metric_value('sky_apiserver_requests_total', {
         'path': '/status',
         'status': '5xx'
@@ -821,8 +892,8 @@ async def test_a_middleware_rejection_on_an_unknown_path_is_bucketed(
     (`/api/.*`, `/dashboard/.*`) matching."""
     app = _app_with_routes()
     request = _http_request(raw_path, reached_router=False, app=app)
-    await prometheus_middleware.dispatch(request,
-                                         AsyncMock(return_value=_response(401)))
+    await _dispatch(prometheus_middleware, request,
+                    AsyncMock(return_value=_response(401)))
     assert _get_metric_value('sky_apiserver_requests_total', {
         'path': label,
         'status': '4xx'
@@ -837,8 +908,8 @@ async def test_a_middleware_rejection_without_an_app_is_still_bounded(
     """No app on the scope (bare ASGI callable): nothing to match against,
     so every rejected path folds into a prefix or `other`."""
     request = _http_request('/status', reached_router=False)
-    await prometheus_middleware.dispatch(request,
-                                         AsyncMock(return_value=_response(503)))
+    await _dispatch(prometheus_middleware, request,
+                    AsyncMock(return_value=_response(503)))
     assert _get_metric_value('sky_apiserver_requests_total', {
         'path': metrics.OTHER_PATH_LABEL,
         'status': '5xx'
@@ -881,8 +952,8 @@ async def test_a_stamped_rejection_is_counted_by_reason(prometheus_middleware):
     request = _http_request('/status', reached_router=False)
     middleware_utils.mark_rejection(
         request, middleware_utils.REJECT_REASON_AUTH_DB_TIMEOUT)
-    await prometheus_middleware.dispatch(request,
-                                         AsyncMock(return_value=_response(503)))
+    await _dispatch(prometheus_middleware, request,
+                    AsyncMock(return_value=_response(503)))
     collectors = [metrics_utils.SKY_APISERVER_REQUEST_REJECTIONS_TOTAL]
     assert _get_metric_value('sky_apiserver_request_rejections_total', {
         'reason': middleware_utils.REJECT_REASON_AUTH_DB_TIMEOUT,
@@ -895,8 +966,8 @@ async def test_a_stamped_rejection_is_counted_by_reason(prometheus_middleware):
 @pytest.mark.asyncio
 async def test_an_unstamped_response_is_not_a_rejection(prometheus_middleware):
     request = _http_request('/status')
-    await prometheus_middleware.dispatch(request,
-                                         AsyncMock(return_value=_response(500)))
+    await _dispatch(prometheus_middleware, request,
+                    AsyncMock(return_value=_response(500)))
     collectors = [metrics_utils.SKY_APISERVER_REQUEST_REJECTIONS_TOTAL]
     assert _get_metric_value('sky_apiserver_request_rejections_total',
                              collectors=collectors) == 0.0
@@ -994,7 +1065,7 @@ async def test_middleware_records_user_metrics(prometheus_middleware_user):
         state={'auth_user': types.SimpleNamespace(name='alice@example.com')})
     call_next = AsyncMock(return_value=_response(200))
 
-    await prometheus_middleware_user.dispatch(request, call_next)
+    await _dispatch(prometheus_middleware_user, request, call_next)
 
     # Check that user metric was recorded
     user_collectors = [metrics_utils.SKY_APISERVER_REQUESTS_BY_USER_TOTAL]
@@ -1014,7 +1085,7 @@ async def test_middleware_records_anonymous_user_metrics(
     request = _http_request('/api/v1/status')  # No auth_user in the state.
     call_next = AsyncMock(return_value=_response(200))
 
-    await prometheus_middleware_user.dispatch(request, call_next)
+    await _dispatch(prometheus_middleware_user, request, call_next)
 
     # Check that anonymous user metric was recorded
     user_collectors = [metrics_utils.SKY_APISERVER_REQUESTS_BY_USER_TOTAL]
@@ -1069,8 +1140,8 @@ async def test_middleware_user_metrics_with_basic_auth(
                return_value=False), \
          patch('sky.jobs.utils.is_consolidation_mode', return_value=False):
 
-        response = await prometheus_middleware_user.dispatch(
-            request, basic_auth_call_next)
+        response = await _dispatch(prometheus_middleware_user, request,
+                                   basic_auth_call_next)
 
     assert response.status_code == 200
     # BasicAuth should have set auth_user
@@ -1106,8 +1177,8 @@ async def test_middleware_user_metrics_with_basic_auth_rejection(
     with patch('sky.server.auth.loopback.is_loopback_request',
                return_value=False), \
          patch('sky.jobs.utils.is_consolidation_mode', return_value=False):
-        response = await prometheus_middleware_user.dispatch(
-            request, basic_auth_call_next)
+        response = await _dispatch(prometheus_middleware_user, request,
+                                   basic_auth_call_next)
 
     assert response.status_code == 401
     final_handler.assert_not_awaited()
@@ -1141,7 +1212,7 @@ async def test_middleware_records_api_get_duration_by_name(
                             })
     call_next = AsyncMock(return_value=_response(200))
 
-    await prometheus_middleware.dispatch(request, call_next)
+    await _dispatch(prometheus_middleware, request, call_next)
 
     get_collectors = [metrics_utils.SKY_APISERVER_REQUEST_GET_DURATION_SECONDS]
     duration_count = _get_metric_value(
@@ -1160,7 +1231,7 @@ async def test_middleware_no_api_get_duration_without_name(
     request = _http_request('/api/v1/status')  # No request_name / auth_user.
     call_next = AsyncMock(return_value=_response(200))
 
-    await prometheus_middleware.dispatch(request, call_next)
+    await _dispatch(prometheus_middleware, request, call_next)
 
     # No per-name series recorded: every _count sample stays at 0.
     registry = CollectorRegistry()
@@ -1347,6 +1418,40 @@ def test_workspace_usage_collector_gpus_sum_over_nodes():
                ('user', 'u'), ('workspace', 'ws'))
     # 8 H100 × (4 + 2) nodes = 48
     assert samples['sky_clusters_gpus_in_flight'][gpu_key] == 48.0
+
+
+def test_workspace_usage_collector_counts_tpu_slices_once():
+    """A multi-host TPU slice on Kubernetes has one pod per VM, while
+    launched_resources describes the whole slice: count its chips once."""
+    from sky import resources as resources_lib
+    clusters = []
+    for accelerators, kwargs, launched_nodes in [
+        ('tpu-v6e-8', {
+            'accelerator_args': {
+                'multi_host': True
+            }
+        }, 2),
+        ('tpu-v6e-16', {}, 8),
+    ]:
+        row = _make_cluster_row(workspace='ws',
+                                user_hash='u',
+                                status_name='UP',
+                                cloud_str='Kubernetes',
+                                launched_nodes=launched_nodes)
+        row['handle'].launched_resources = resources_lib.Resources(
+            infra='k8s/ctx', accelerators=accelerators, **kwargs)
+        clusters.append(row)
+    with patch('sky.global_user_state.get_clusters', return_value=clusters):
+        collector = metrics.WorkspaceUsageCollector()
+        samples = _collect_to_dict(collector)
+
+    gpus = {
+        dict(key)['gpu_type']: value
+        for key, value in samples['sky_clusters_gpus_in_flight'].items()
+    }
+    # One tpu-v6e-8 slice on 2 pods, and two tpu-v6e-16 slices on 8 pods.
+    # The count is per slice, as for the same request on GCP.
+    assert gpus == {'tpu-v6e-8': 1.0, 'tpu-v6e-16': 2.0}
 
 
 def test_workspace_usage_collector_cpu_only_cluster_emits_no_gpu():
@@ -2152,3 +2257,21 @@ def _histogram_count(histogram):
             if sample.name.endswith('_count'):
                 return sample.value
     return 0.0
+
+
+def test_federation_targets_leave_out_known_unreachable_contexts(monkeypatch):
+    """A context a registered check names is neither federated nor probed for
+    being the local cluster."""
+    monkeypatch.setattr(
+        metrics.kubernetes_utils, '_CONTEXT_UNREACHABLE_CHECKS',
+        [lambda context: 'proxy is down' if context == 'down' else None])
+    monkeypatch.setattr(metrics.skypilot_config, 'reload_config', lambda: None)
+    monkeypatch.setattr(metrics.core, 'get_all_contexts',
+                        lambda: ['up', 'down'])
+    split = MagicMock(return_value=([], ['up']))
+    monkeypatch.setattr(metrics.metrics_utils, 'split_local_remote_contexts',
+                        split)
+    monkeypatch.setattr(metrics.metrics_utils, 'get_slurm_metrics_clusters',
+                        lambda: [])
+    assert metrics._FederationTargets()._prologue() == (['up'], [])
+    split.assert_called_once_with(['up'])

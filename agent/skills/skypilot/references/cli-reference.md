@@ -518,6 +518,7 @@ Show statuses of SkyServe services.
 
 - `--config` — Path to a config file or a single key-value pair. To add multiple key-value pairs add multiple flags (e.g. --config nested.key1=val1 --config nested.key2=val2).
 - `--verbose`, `-v` — Show all information in full.
+- `--all`, `-a` — Show all replicas.
 - `--endpoint` — Show service endpoint.
 - `SERVICE_NAMES` — text
 
@@ -645,6 +646,7 @@ Delete volumes.
 - `NAMES` — text
 - `--all`, `-a` — Delete all volumes.
 - `--purge`, `-p` — Forcibly delete the volume from the volumes table even if the deletion API fails.
+- `--no-cleanup` — Keep the files of k8s-hostpath volumes registered with cleanup_on_deletion.
 - `--yes`, `-y` — Skip confirmation prompt.
 - `--async`, `--no-async` — Run the command asynchronously.
 
@@ -673,7 +675,7 @@ Cancel a request running on SkyPilot API server.
 - `--config` — Path to a config file or a single key-value pair. To add multiple key-value pairs add multiple flags (e.g. --config nested.key1=val1 --config nested.key2=val2).
 - `REQUEST_IDS` — text
 - `--all`, `-a` — Cancel all your requests.
-- `--all-users`, `-u` — Cancel all requests from all users.
+- `--all-users`, `-u` — Cancel all requests from all users. On a server with per-user auth, a non-admin cancels only their own.
 - `--yes`, `-y` — Skip confirmation prompt.
 
 ### `sky api info`
