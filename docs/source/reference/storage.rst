@@ -461,6 +461,20 @@ Then mount the bucket like any other object store:
     the ``fusermount-server`` DaemonSet (see
     :ref:`kubernetes-deployment`).
 
+To diagnose a setup, run the self-check script from a checkout of the
+repository on the machine that talks to RustFS (the API server for a
+Kubernetes deployment):
+
+.. code-block:: console
+
+    $ python scripts/check_rustfs.py --bucket my-bucket --write-test
+
+It checks the configuration, the credentials file that gets mounted onto the
+nodes, endpoint reachability, the S3 API, access to one bucket (with an
+optional put/get/delete round trip), the FUSE prerequisites of ``MOUNT`` mode,
+and whether ``sky check`` reports RustFS. Every failing check prints a hint,
+and the exit code is non-zero when a check fails.
+
 
 Using SkyPilot storage CLI
 --------------------------
