@@ -673,6 +673,35 @@ def get_r2_mount_cmd(r2_credentials_path: str,
                                         read_only=read_only)
 
 
+def get_rustfs_mount_cmd(rustfs_credentials_path: str,
+                         rustfs_profile_name: str,
+                         endpoint_url: str,
+                         bucket_name: str,
+                         mount_path: str,
+                         region: Optional[str] = None,
+                         _bucket_sub_path: Optional[str] = None,
+                         read_only: bool = False) -> str:
+    """Returns a command to mount a RustFS bucket.
+
+    RustFS is a self-hosted S3-compatible server, so it needs an explicit
+    endpoint. It serves path-style addressing by default (the bucket is in
+    the URL path, not the hostname), hence --s3-force-path-style=true for
+    rclone; goofys is path-style unless --subdomain is passed, which is not
+    the case here.
+    """
+    cred_env = (f'AWS_SHARED_CREDENTIALS_FILE={rustfs_credentials_path} '
+                f'AWS_PROFILE={rustfs_profile_name}')
+    return _get_s3_compatible_mount_cmd(
+        bucket_name=bucket_name,
+        mount_path=mount_path,
+        _bucket_sub_path=_bucket_sub_path,
+        endpoint_url=endpoint_url,
+        region=region,
+        cred_env=cred_env,
+        rclone_extra_flags='--s3-force-path-style=true',
+        read_only=read_only)
+
+
 def get_cos_mount_cmd(rclone_config: str,
                       rclone_profile_name: str,
                       bucket_name: str,

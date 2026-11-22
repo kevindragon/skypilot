@@ -24,6 +24,7 @@ from sky.adaptors import ibm
 from sky.adaptors import nebius
 from sky.adaptors import oci
 from sky.adaptors import oci_s3
+from sky.adaptors import rustfs
 from sky.adaptors import vastdata
 from sky.clouds import gcp
 from sky.data import data_utils
@@ -855,6 +856,64 @@ class VastDataCloudStorage(CloudStorage):
         return ' && '.join(all_commands)
 
 
+class RustFSCloudStorage(CloudStorage):
+    """RustFS Cloud Storage (self-hosted, S3-compatible)."""
+
+    _GET_AWSCLI = [
+        'aws --version >/dev/null 2>&1 || '
+        f'{constants.SKY_UV_PIP_CMD} install awscli',
+    ]
+
+    def is_directory(self, url: str) -> bool:
+        """Returns whether RustFS 'url' is a directory."""
+        rustfs_s3 = rustfs.resource('s3')
+        bucket_name, path = data_utils.split_rustfs_path(url)
+        bucket = rustfs_s3.Bucket(bucket_name)
+
+        num_objects = 0
+        for obj in bucket.objects.filter(Prefix=path):
+            num_objects += 1
+            if obj.key == path:
+                return False
+            if num_objects == 3:
+                return True
+
+        return True
+
+    def make_sync_dir_command(self, source: str, destination: str) -> str:
+        """Downloads using AWS CLI."""
+        assert 'rustfs://' in source, 'rustfs:// is not in source'
+        source = source.replace('rustfs://', 's3://')
+        endpoint_url = rustfs.get_endpoint_url()
+        download_via_awscli = ('AWS_SHARED_CREDENTIALS_FILE='
+                               f'{rustfs.RUSTFS_CREDENTIALS_PATH} '
+                               f'{constants.SKY_REMOTE_PYTHON_ENV}/bin/aws s3 '
+                               'sync --no-follow-symlinks '
+                               f'{source} {destination} '
+                               f'--endpoint-url {endpoint_url} '
+                               f'--profile={rustfs.RUSTFS_PROFILE_NAME}')
+
+        all_commands = list(self._GET_AWSCLI)
+        all_commands.append(download_via_awscli)
+        return ' && '.join(all_commands)
+
+    def make_sync_file_command(self, source: str, destination: str) -> str:
+        """Downloads a file using AWS CLI."""
+        assert 'rustfs://' in source, 'rustfs:// is not in source'
+        source = source.replace('rustfs://', 's3://')
+        endpoint_url = rustfs.get_endpoint_url()
+        download_via_awscli = ('AWS_SHARED_CREDENTIALS_FILE='
+                               f'{rustfs.RUSTFS_CREDENTIALS_PATH} '
+                               f'{constants.SKY_REMOTE_PYTHON_ENV}/bin/aws s3 '
+                               f'cp {source} {destination} '
+                               f'--endpoint-url {endpoint_url} '
+                               f'--profile={rustfs.RUSTFS_PROFILE_NAME}')
+
+        all_commands = list(self._GET_AWSCLI)
+        all_commands.append(download_via_awscli)
+        return ' && '.join(all_commands)
+
+
 class HFCloudStorage(CloudStorage):
     """Hugging Face Buckets and Hub repos."""
 
@@ -1071,6 +1130,7 @@ _REGISTRY = {
     'nebius': NebiusCloudStorage(),
     'cw': CoreWeaveCloudStorage(),
     'vastdata': VastDataCloudStorage(),
+    'rustfs': RustFSCloudStorage(),
     'hf': HFCloudStorage(),
     # TODO: This is a hack, as Azure URL starts with https://, we should
     # refactor the registry to be able to take regex, so that Azure blob can

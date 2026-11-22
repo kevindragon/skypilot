@@ -28,7 +28,7 @@ Object storages are specified using the :code:`file_mounts` field in a SkyPilot 
           # Mount an existing S3 bucket
           file_mounts:
             /my_data:
-              source: s3://my-bucket/  # or gs://, https://<azure_storage_account>.blob.core.windows.net/<container>, r2://, cw://, vastdata://, cos://<region>/<bucket>, oci://<bucket_name>, hf://
+              source: s3://my-bucket/  # or gs://, https://<azure_storage_account>.blob.core.windows.net/<container>, r2://, cw://, vastdata://, cos://<region>/<bucket>, oci://<bucket_name>, rustfs://<bucket_name>, hf://
               mode: MOUNT  # MOUNT or COPY or MOUNT_CACHED. Defaults to MOUNT. Optional.
 
         This will `mount <storage-mounting-modes_>`__ the contents of the bucket at ``s3://my-bucket/`` to the remote VM at ``/my_data``.
@@ -418,6 +418,50 @@ omitted whenever ``source`` already uses the ``hf://`` scheme.
     downloads via ``huggingface_hub`` and needs no FUSE).
 
 
+.. _rustfs-storage:
+
+Using RustFS storage
+~~~~~~~~~~~~~~~~~~~~~
+
+`RustFS <https://rustfs.com>`_ is a self-hosted, S3-compatible object storage
+server. Since it is reached through a custom endpoint (e.g.
+``http://10.0.0.10:7112``) rather than the AWS S3 endpoint, it needs its own
+configuration. Configure it in ``~/.sky/config.yaml``:
+
+.. code-block:: yaml
+
+    rustfs:
+      endpoint: http://10.0.0.10:7112
+      access_key: <access key>
+      secret_key: <secret key>
+      region: us-east-1  # Optional, defaults to us-east-1.
+
+The same values can be provided through the ``RUSTFS_ENDPOINT``,
+``RUSTFS_ACCESS_KEY``, ``RUSTFS_SECRET_KEY`` and ``RUSTFS_REGION``
+environment variables, which take precedence over the config file.
+
+Then mount the bucket like any other object store:
+
+.. code-block:: yaml
+
+    file_mounts:
+      /mnt/rustfs:
+        source: rustfs://my-bucket
+        mode: MOUNT
+
+.. note::
+    RustFS serves path-style addressing (the bucket is part of the URL
+    path, not the hostname), which SkyPilot uses for RustFS. If your RustFS
+    deployment is fronted by a wildcard DNS entry, virtual-hosted style
+    also works.
+
+.. note::
+    The API server and the compute nodes must be able to reach the
+    configured endpoint. On Kubernetes, the FUSE mounts additionally require
+    the ``fusermount-server`` DaemonSet (see
+    :ref:`kubernetes-deployment`).
+
+
 Using SkyPilot storage CLI
 --------------------------
 
@@ -535,13 +579,14 @@ Storage YAML reference
             - vastdata://<bucket_name>
             - cos://<region_name>/<bucket_name>
             - oci://<bucket_name>@<region>
+            - rustfs://<bucket_name>
             - hf://buckets/<namespace>/<bucket_name>  (see the Hugging Face CLI for the full URL syntax of repos, datasets, and spaces)
 
           If the source is local, data is uploaded to the cloud to an appropriate
-          bucket (s3, gcs, azure, r2, coreweave, vastdata, oci, ibm, or hf). If source is bucket URI,
+          bucket (s3, gcs, azure, r2, coreweave, vastdata, oci, ibm, rustfs, or hf). If source is bucket URI,
           the data is copied or mounted directly (see mode flag below).
 
-        store: str; either of 's3', 'gcs', 'azure', 'r2', 'coreweave', 'vastdata', 'ibm', 'oci', 'hf'
+        store: str; either of 's3', 'gcs', 'azure', 'r2', 'coreweave', 'vastdata', 'ibm', 'oci', 'rustfs', 'hf'
           If you wish to force sky.Storage to be backed by a specific cloud object
           storage, you can specify it here. If not specified, SkyPilot chooses the
           appropriate object storage based on the source path and task's cloud provider.

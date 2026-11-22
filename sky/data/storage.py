@@ -33,6 +33,7 @@ from sky.adaptors import ibm
 from sky.adaptors import nebius
 from sky.adaptors import oci
 from sky.adaptors import oci_s3
+from sky.adaptors import rustfs
 from sky.adaptors import vastdata
 from sky.clouds import cloud as sky_cloud
 from sky.data import data_transfer
@@ -72,6 +73,7 @@ STORE_ENABLED_CLOUDS: List[str] = [
     coreweave.NAME,
     vastdata.NAME,
     huggingface.NAME,
+    rustfs.NAME,
 ]
 
 # Maximum number of concurrent rsync upload processes
@@ -117,6 +119,10 @@ def get_cached_enabled_storage_cloud_names_or_refresh(
     if hf_is_enabled:
         enabled_clouds.append(huggingface.NAME)
 
+    rustfs_is_enabled, _ = rustfs.check_storage_credentials()
+    if rustfs_is_enabled:
+        enabled_clouds.append(rustfs.NAME)
+
     if raise_if_no_cloud_access and not enabled_clouds:
         raise exceptions.NoCloudAccessError(
             'No cloud access available for storage. '
@@ -153,6 +159,7 @@ class StoreType(enum.Enum):
     COREWEAVE = 'COREWEAVE'
     VASTDATA = 'VASTDATA'
     HF = 'HF'
+    RUSTFS = 'RUSTFS'
     VOLUME = 'VOLUME'
 
     @classmethod
@@ -1426,6 +1433,12 @@ class Storage(object):
                         _bucket_sub_path=self._bucket_sub_path)
                 elif s_type == StoreType.COREWEAVE:
                     store = CoreWeaveStore.from_metadata(
+                        s_metadata,
+                        source=self.source,
+                        sync_on_reconstruction=self.sync_on_reconstruction,
+                        _bucket_sub_path=self._bucket_sub_path)
+                elif s_type == StoreType.RUSTFS:
+                    store = RustFSStore.from_metadata(
                         s_metadata,
                         source=self.source,
                         sync_on_reconstruction=self.sync_on_reconstruction,
@@ -5262,6 +5275,68 @@ class VastDataStore(S3CompatibleStore):
         rclone_profile_name = (
             data_utils.Rclone.RcloneStores.VASTDATA.get_profile_name(self.name))
         rclone_config = data_utils.Rclone.RcloneStores.VASTDATA.get_config(
+            rclone_profile_name=rclone_profile_name)
+        mount_cached_cmd = mounting_utils.get_mount_cached_cmd(
+            rclone_config, rclone_profile_name, self.bucket.name, mount_path,
+            config)
+        return mounting_utils.get_mounting_command(mount_path, install_cmd,
+                                                   mount_cached_cmd)
+
+
+@register_s3_compatible_store
+class RustFSStore(S3CompatibleStore):
+    """RustFSStore inherits from S3CompatibleStore and represents the backend
+    for buckets served by a self-hosted RustFS server.
+
+    RustFS is S3-compatible but is reached through a custom endpoint (e.g.
+    http://10.0.0.10:7112) instead of the AWS S3 endpoint, so both the
+    client and the mount command need to be pointed at it explicitly.
+    """
+
+    @classmethod
+    def get_config(cls) -> S3CompatibleConfig:
+        """Return the configuration for RustFS."""
+        return S3CompatibleConfig(
+            store_type='RUSTFS',
+            url_prefix='rustfs://',
+            client_factory=lambda region: data_utils.create_rustfs_client(),
+            resource_factory=lambda name: rustfs.resource('s3').Bucket(name),
+            split_path=data_utils.split_rustfs_path,
+            verify_bucket=data_utils.verify_rustfs_bucket,
+            aws_profile=rustfs.RUSTFS_PROFILE_NAME,
+            get_endpoint_url=rustfs.get_endpoint_url,
+            credentials_file=rustfs.RUSTFS_CREDENTIALS_PATH,
+            cloud_name=rustfs.NAME,
+            default_region=rustfs.get_region(),
+            mount_cmd_factory=cls._get_rustfs_mount_cmd,
+        )
+
+    @classmethod
+    def _get_rustfs_mount_cmd(cls,
+                              bucket_name: str,
+                              mount_path: str,
+                              bucket_sub_path: Optional[str],
+                              read_only: bool = False) -> str:
+        """Factory method for RustFS mount command."""
+        endpoint_url = rustfs.get_endpoint_url()
+        return mounting_utils.get_rustfs_mount_cmd(
+            rustfs.RUSTFS_CREDENTIALS_PATH,
+            rustfs.RUSTFS_PROFILE_NAME,
+            endpoint_url,
+            bucket_name,
+            mount_path,
+            region=rustfs.get_region(),
+            _bucket_sub_path=bucket_sub_path,
+            read_only=read_only)
+
+    def mount_cached_command(self,
+                             mount_path: str,
+                             config: Optional[MountCachedConfig] = None) -> str:
+        """RustFS-specific cached mount implementation using rclone."""
+        install_cmd = mounting_utils.get_rclone_install_cmd()
+        rclone_profile_name = (
+            data_utils.Rclone.RcloneStores.RUSTFS.get_profile_name(self.name))
+        rclone_config = data_utils.Rclone.RcloneStores.RUSTFS.get_config(
             rclone_profile_name=rclone_profile_name)
         mount_cached_cmd = mounting_utils.get_mount_cached_cmd(
             rclone_config, rclone_profile_name, self.bucket.name, mount_path,

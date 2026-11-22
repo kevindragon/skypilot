@@ -219,6 +219,9 @@ cloud_dependencies: Dict[str, List[str]] = {
     'lambda': [],  # No dependencies needed for lambda
     'cloudflare': aws_dependencies,
     'coreweave': aws_dependencies + kubernetes_dependencies,
+    # RustFS is a self-hosted S3-compatible object storage; it only needs
+    # the AWS SDK to talk to its S3 API.
+    'rustfs': aws_dependencies,
     # Hugging Face Buckets require huggingface_hub>=1.5 (first version with
     # the full buckets API: create_bucket / bucket_info / sync_bucket /
     # batch_bucket_files / list_bucket_tree / download_bucket_files).

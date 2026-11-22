@@ -3111,6 +3111,28 @@ def get_config_schema():
             'admin_policy': admin_policy_schema,
             'docker': docker_configs,
             'nvidia_gpus': gpu_configs,
+            # Self-hosted RustFS (S3-compatible) object storage. It is not a
+            # compute cloud, so it lives at the top level rather than in
+            # cloud_configs.
+            'rustfs': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'endpoint': {
+                        'type': 'string',
+                    },
+                    'access_key': {
+                        'type': 'string',
+                    },
+                    'secret_key': {
+                        'type': 'string',
+                    },
+                    'region': {
+                        'type': 'string',
+                    },
+                },
+            },
             'api_server': api_server,
             'active_workspace': workspace_schema,
             'workspaces': workspaces_schema,

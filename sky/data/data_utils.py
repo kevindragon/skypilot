@@ -26,6 +26,7 @@ from sky.adaptors import ibm
 from sky.adaptors import nebius
 from sky.adaptors import oci
 from sky.adaptors import oci_s3
+from sky.adaptors import rustfs
 from sky.adaptors import vastdata
 from sky.skylet import constants
 from sky.skylet import log_lib
@@ -747,6 +748,7 @@ class Rclone:
         COREWEAVE = 'COREWEAVE'
         VASTDATA = 'VASTDATA'
         OCI = 'OCI'
+        RUSTFS = 'RUSTFS'
 
         def get_profile_name(self, bucket_name: str) -> str:
             """Gets the Rclone profile name for a given bucket.
@@ -768,6 +770,7 @@ class Rclone:
                 Rclone.RcloneStores.COREWEAVE: 'sky-coreweave',
                 Rclone.RcloneStores.VASTDATA: 'sky-vastdata',
                 Rclone.RcloneStores.OCI: 'sky-oci',
+                Rclone.RcloneStores.RUSTFS: 'sky-rustfs',
             }
             return f'{profile_prefix[self]}-{bucket_name}'
 
@@ -942,6 +945,21 @@ class Rclone:
                     endpoint = {endpoint_url}
                     region = auto
                     acl = private
+                    """)
+            elif self is Rclone.RcloneStores.RUSTFS:
+                endpoint_url = rustfs.get_endpoint_url()
+                access_key_id = rustfs.get_access_key()
+                secret_access_key = rustfs.get_secret_key()
+                config = textwrap.dedent(f"""\
+                    [{rclone_profile_name}]
+                    type = s3
+                    provider = Other
+                    access_key_id = {access_key_id}
+                    secret_access_key = {secret_access_key}
+                    endpoint = {endpoint_url}
+                    region = {rustfs.get_region()}
+                    acl = private
+                    force_path_style = true
                     """)
             else:
                 with ux_utils.print_exception_no_traceback():
@@ -1194,6 +1212,40 @@ def verify_coreweave_bucket(name: str, retry: int = 0) -> bool:
 
     # Should not reach here, but just in case
     return False
+
+
+def create_rustfs_client() -> Client:
+    """Create a client for a RustFS (S3-compatible) server."""
+    return rustfs.client('s3')
+
+
+def split_rustfs_path(rustfs_path: str) -> Tuple[str, str]:
+    """Splits RustFS Path into Bucket name and Relative Path to Bucket
+
+    Args:
+      rustfs_path: str; RustFS Path, e.g. rustfs://imagenet/train/
+    """
+    path_parts = rustfs_path.replace('rustfs://', '').split('/')
+    bucket = path_parts.pop(0)
+    key = '/'.join(path_parts)
+    return bucket, key
+
+
+def verify_rustfs_bucket(name: str) -> bool:
+    """Verify a RustFS bucket exists and is accessible."""
+    client = create_rustfs_client()
+    try:
+        client.head_bucket(Bucket=name)
+        return True
+    except rustfs.botocore_exceptions().ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ('403', 'AccessDenied'):
+            logger.error(f'Access denied to RustFS bucket {name}')
+        elif error_code in ('404', 'NoSuchBucket'):
+            logger.debug(f'RustFS bucket {name} does not exist')
+        else:
+            logger.debug(f'Unexpected error checking RustFS bucket {name}: {e}')
+        return False
 
 
 def create_vastdata_client() -> Client:
