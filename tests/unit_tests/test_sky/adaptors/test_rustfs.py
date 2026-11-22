@@ -162,6 +162,31 @@ class TestRustFSStorage(unittest.TestCase):
         self.assertEqual(storage_lib.StoreType.from_cloud('rustfs'),
                          storage_lib.StoreType.RUSTFS)
 
+    def test_supported_storage_schemes_include_rustfs(self):
+        schemes = storage_lib._get_supported_storage_schemes()  # pylint: disable=protected-access
+        self.assertIn('rustfs', schemes)
+        # The pre-existing schemes must keep working.
+        for scheme in ('s3', 'gs', 'https', 'r2', 'cos', 'oci', 'nebius', 'cw',
+                       'vastdata', 'hf'):
+            self.assertIn(scheme, schemes)
+
+    def test_validate_source_accepts_rustfs(self):
+        """A rustfs:// source must pass source validation.
+
+        Regression test for the hardcoded scheme whitelist that rejected
+        rustfs:// with 'Supported paths: ...' before the store registry was
+        consulted.
+        """
+        (source, is_local_source) = storage_lib.Storage._validate_source(  # pylint: disable=protected-access
+            'rustfs://test-sky', storage_lib.StorageMode.MOUNT, True)
+        self.assertEqual(source, 'rustfs://test-sky')
+        self.assertFalse(is_local_source)
+
+    def test_validate_source_rejects_unknown_scheme(self):
+        with self.assertRaises(exceptions.StorageSourceError):
+            storage_lib.Storage._validate_source(  # pylint: disable=protected-access
+                'notastore://bucket', storage_lib.StorageMode.MOUNT, True)
+
     def test_mount_cmd_contains_endpoint_and_path_style(self):
         cmd = mounting_utils.get_rustfs_mount_cmd(
             rustfs.RUSTFS_CREDENTIALS_PATH,

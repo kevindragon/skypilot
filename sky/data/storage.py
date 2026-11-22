@@ -440,6 +440,22 @@ MOUNTABLE_STORAGE_MODES = [
 DEFAULT_STORAGE_MODE = StorageMode.MOUNT
 
 
+def _get_supported_storage_schemes() -> Set[str]:
+    """Returns the bucket URI schemes accepted for a storage ``source``.
+
+    Every registered S3-compatible store contributes its own prefix, so
+    registering a new store does not require updating a separate list here.
+    The remaining schemes are the non-S3-compatible stores (GCS, Azure Blob,
+    IBM COS, OCI and Hugging Face).
+    """
+    schemes = {
+        store_class.get_config().url_prefix[:-len('://')]
+        for store_class in _S3_COMPATIBLE_STORES.values()
+    }
+    schemes.update({'gs', 'https', 'cos', 'oci', 'nebius', 'hf'})
+    return schemes
+
+
 class FileMountType(enum.Enum):
     """Pre-defined parameter types for MOUNT_CACHED mode.
 
@@ -1337,10 +1353,7 @@ class Storage(object):
                             'using a bucket by writing <destination_path>: '
                             f'{source} in the file_mounts section of your YAML')
                 is_local_source = True
-            elif split_path.scheme in [
-                    's3', 'gs', 'https', 'r2', 'cos', 'oci', 'nebius', 'cw',
-                    'vastdata', 'hf'
-            ]:
+            elif split_path.scheme in _get_supported_storage_schemes():
                 is_local_source = False
                 # Storage mounting does not support mounting specific files from
                 # cloud store - ensure path points to only a directory.
@@ -1365,10 +1378,12 @@ class Storage(object):
                                 ' the source.')
             else:
                 with ux_utils.print_exception_no_traceback():
+                    supported = ', '.join(
+                        f'{scheme}://'
+                        for scheme in sorted(_get_supported_storage_schemes()))
                     raise exceptions.StorageSourceError(
-                        f'Supported paths: local, s3://, gs://, https://, '
-                        f'r2://, cos://, oci://, nebius://, cw://, '
-                        f'vastdata://, hf://. Got: {source}')
+                        f'Supported paths: local, {supported}. '
+                        f'Got: {source}')
         return source, is_local_source
 
     def _validate_storage_spec(self, name: Optional[str]) -> None:
@@ -1383,18 +1398,7 @@ class Storage(object):
             """
             prefix = name.split('://')[0]
             prefix = prefix.lower()
-            if prefix in [
-                    's3',
-                    'gs',
-                    'https',
-                    'r2',
-                    'cos',
-                    'oci',
-                    'nebius',
-                    'cw',
-                    'vastdata',
-                    'hf',
-            ]:
+            if prefix in _get_supported_storage_schemes():
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageNameError(
                         'Prefix detected: `name` cannot start with '
